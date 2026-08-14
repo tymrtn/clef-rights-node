@@ -1,0 +1,35 @@
+name: Rights-administrator feedback
+description: Describe where a controlled rights workflow succeeds or fails.
+title: "pilot-feedback: "
+labels: [pilot-feedback]
+body:
+  - type: dropdown
+    id: organization
+    attributes:
+      label: Organization type
+      options: [Label, Publisher, PRO or CMO, Collective, Catalog administrator, Artist-run organization, Requester, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Synthetic or consented workflow tested
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Decision that became difficult, ambiguous, or impossible
+    validations:
+      required: true
+  - type: textarea
+    id: records
+    attributes:
+      label: Record, policy dimension, or role involved
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Disclosure check
+      options:
+        - label: I have permission to publish the organizations, works, and evidence named here, or I used synthetic data.
+          required: true

@@ -1,0 +1,36 @@
+name: Standards gap
+description: Document a concrete mismatch between an implemented workflow and an external standard.
+title: "standards-gap: "
+labels: [standards-gap, needs-evidence]
+body:
+  - type: input
+    id: standard
+    attributes:
+      label: Standard and exact version
+    validations:
+      required: true
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Real workflow that cannot be represented
+    validations:
+      required: true
+  - type: textarea
+    id: citations
+    attributes:
+      label: Clause, schema, fixture, or implementation evidence
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround and consequence
+    validations:
+      required: true
+  - type: checkboxes
+    id: representation
+    attributes:
+      label: Representation check
+      options:
+        - label: This report does not imply endorsement, conformance, or approval by the standards body.
+          required: true

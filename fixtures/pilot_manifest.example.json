@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "clef.real-pilot-manifest.v1",
+  "pilotId": "label-client-work-2026-01",
+  "authorityOrganizationId": "replace-with-authority-organization-id",
+  "requesterOrganizationId": "replace-with-requester-organization-id",
+  "permissionRequestId": "replace-with-approved-permission-request-id",
+  "workKey": "iswc:T1234567890",
+  "catalogAssetId": "replace-with-catalog-asset-id",
+  "catalogClientReference": "client-reference-from-royalty-system",
+  "rightType": "composition",
+  "intendedUsage": "ai_grounded_generation",
+  "territory": "US",
+  "authorityEvidence": {
+    "source": "administration_agreement",
+    "reference": "contract-system-reference",
+    "documentSha256": "replace-with-the-64-character-sha256-of-the-private-evidence-file",
+    "file": "/absolute/path/to/private/evidence.pdf"
+  },
+  "publicationUrlSha256": "replace-with-the-64-character-sha256-of-the-exact-publication-url",
+  "requiredCapabilities": [
+    "mlc:catalog_lookup"
+  ],
+  "requireProductionSource": true,
+  "attestations": {
+    "catalogIsGenuinelyAdministered": true,
+    "authorityEvidenceIsAuthentic": true,
+    "requestRepresentsGenuineIntendedUse": true,
+    "publicationEvidenceIsAuthentic": true,
+    "settlementEvidenceRepresentsExternalTransfers": true
+  }
+}

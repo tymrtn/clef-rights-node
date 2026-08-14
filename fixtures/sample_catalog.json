@@ -1,0 +1,183 @@
+{
+  "items": [
+    {
+      "key": "DEMO-001",
+      "artist": "Demo Artist",
+      "note": "Brand-safe default",
+      "contract": {
+        "policyVersion": "2.1",
+        "artistName": "Demo Artist",
+        "artist": {
+          "usageMatrix": {
+            "ads_brand": "requires_approval",
+            "ads_political": "blocked",
+            "ads_psa": "allowed",
+            "film_tv": "requires_approval",
+            "streaming_visual": "allowed",
+            "video_game": "requires_approval",
+            "podcast_audio": "allowed",
+            "ugc_creator": "allowed",
+            "live_performance": "allowed",
+            "background_music": "allowed",
+            "corporate_internal": "requires_approval",
+            "educational": "allowed",
+            "personal_noncommercial": "allowed",
+            "ai_training_recursive": "blocked",
+            "derivative_remix": "requires_approval"
+          },
+          "restrictionMatrix": {},
+          "approval": {
+            "approvalWindowDays": 14
+          }
+        },
+        "publisher": {
+          "royalties": {
+            "splits": []
+          }
+        },
+        "master": {
+          "stance": "extended",
+          "pricing": {
+            "basePriceUsd": {
+              "streaming_visual": 50,
+              "ugc_creator": 10,
+              "ads_brand": 500
+            },
+            "licenseStanceMultiplier": 1.0,
+            "audienceReachMultiplier": 1.0,
+            "surcharges": {}
+          }
+        },
+        "matrix": {
+          "usage": {},
+          "restrictions": {}
+        },
+        "metadata": {
+          "archetypeId": "brand_safe"
+        }
+      }
+    },
+    {
+      "key": "DEMO-002",
+      "artist": "Legacy Estate",
+      "note": "Legacy protective stance",
+      "contract": {
+        "policyVersion": "2.1",
+        "artistName": "Legacy Estate",
+        "artist": {
+          "usageMatrix": {
+            "ads_brand": "blocked",
+            "ads_political": "blocked",
+            "ads_psa": "requires_approval",
+            "film_tv": "requires_approval",
+            "streaming_visual": "requires_approval",
+            "video_game": "blocked",
+            "podcast_audio": "requires_approval",
+            "ugc_creator": "blocked",
+            "live_performance": "requires_approval",
+            "background_music": "requires_approval",
+            "corporate_internal": "requires_approval",
+            "educational": "allowed",
+            "personal_noncommercial": "allowed",
+            "ai_training_recursive": "blocked",
+            "derivative_remix": "blocked"
+          },
+          "restrictionMatrix": {
+            "political": "denied",
+            "adult": "denied",
+            "alcohol_tobacco_cannabis": "conditional",
+            "likeness_voice_clone": "denied"
+          },
+          "approval": {
+            "approvalWindowDays": 30
+          }
+        },
+        "publisher": {
+          "royalties": {
+            "splits": []
+          }
+        },
+        "master": {
+          "stance": "selective",
+          "pricing": {
+            "basePriceUsd": {
+              "film_tv": 2000,
+              "streaming_visual": 750
+            },
+            "licenseStanceMultiplier": 1.2,
+            "audienceReachMultiplier": 1.0,
+            "surcharges": {
+              "political": 9999
+            }
+          }
+        },
+        "matrix": {
+          "usage": {},
+          "restrictions": {}
+        },
+        "metadata": {
+          "archetypeId": "legacy_protective"
+        }
+      }
+    },
+    {
+      "key": "DEMO-003",
+      "artist": "Indie Creator",
+      "note": "Creator-friendly macro",
+      "contract": {
+        "policyVersion": "2.1",
+        "artistName": "Indie Creator",
+        "artist": {
+          "usageMatrix": {
+            "ads_brand": "allowed",
+            "ads_political": "conditional",
+            "ads_psa": "allowed",
+            "film_tv": "allowed",
+            "streaming_visual": "allowed",
+            "video_game": "allowed",
+            "podcast_audio": "allowed",
+            "ugc_creator": "allowed",
+            "live_performance": "allowed",
+            "background_music": "allowed",
+            "corporate_internal": "allowed",
+            "educational": "allowed",
+            "personal_noncommercial": "allowed",
+            "ai_training_recursive": "requires_approval",
+            "derivative_remix": "allowed"
+          },
+          "restrictionMatrix": {
+            "deceptive_endorsement": "denied",
+            "likeness_voice_clone": "conditional"
+          },
+          "approval": {
+            "approvalWindowDays": 7
+          }
+        },
+        "publisher": {
+          "royalties": {
+            "splits": []
+          }
+        },
+        "master": {
+          "stance": "open",
+          "pricing": {
+            "basePriceUsd": {
+              "ugc_creator": 5,
+              "streaming_visual": 15
+            },
+            "licenseStanceMultiplier": 0.9,
+            "audienceReachMultiplier": 1.0,
+            "surcharges": {}
+          }
+        },
+        "matrix": {
+          "usage": {},
+          "restrictions": {}
+        },
+        "metadata": {
+          "archetypeId": "creator_friendly"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+name: Product defect
+description: Report reproducible behavior that differs from the documented protocol.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, personal data, private contracts, or exploitable security details. Use a private advisory for vulnerabilities.
+  - type: input
+    id: revision
+    attributes:
+      label: Source revision
+      description: Commit or release tag shown by /v1/node/info.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal synthetic steps, expected result, and actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Logs, receipt IDs, or test output with secrets and real catalog data removed.
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Safety check
+      options:
+        - label: This report contains no private or confidential material.
+          required: true

@@ -1,0 +1,35 @@
+name: Deployment report
+description: Report a clean synthetic installation or a reproducible installation failure.
+title: "deployment: "
+labels: [deployment]
+body:
+  - type: input
+    id: revision
+    attributes:
+      label: Source revision
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Deployment mode
+      options: [Docker Compose, Railway, Other adopter-owned environment]
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and elapsed setup time
+      description: Exclude domains or details that should remain private.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Verification commands and result
+    validations:
+      required: true
+  - type: textarea
+    id: friction
+    attributes:
+      label: Difficult, missing, or misleading steps

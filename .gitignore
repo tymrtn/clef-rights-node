@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Process IDs
+*.pid
+.backend.pid
+.frontend.pid
+
+# Environment
+.env
+.env.local
+
+# Operator-installed DDEX schemas (downloaded under DDEX licence terms)
+var/ddex/mwl-1.0.1/*
+!var/ddex/mwl-1.0.1/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node/Frontend
+node_modules/
+dist/
+.cache/
+.clawpatch/
+coverage/

@@ -1,0 +1,41 @@
+name: Protocol RFC
+description: Propose a change to policy, authority, receipt, lifecycle, or verification semantics.
+title: "rfc: "
+labels: [rfc, discussion]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Observed problem and affected actors
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and current behavior
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed semantics
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives, dissent, and unresolved questions
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Privacy, abuse, compatibility, and migration impact
+    validations:
+      required: true
+  - type: textarea
+    id: fixtures
+    attributes:
+      label: Regression fixtures or acceptance test
+    validations:
+      required: true

@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: rights_node_ci
+          POSTGRES_USER: rights
+          POSTGRES_PASSWORD: rights
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rights -d rights_node_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: pip install -r backend/requirements.txt
+      - run: python -m compileall -q backend
+      - run: PYTHONPATH=. pytest -q
+        working-directory: backend
+      - run: python scripts/verify_rightsholder_workflow.py
+      - run: python scripts/verify_ddex_mwl.py
+      - run: python scripts/verify_deployment_configs.py
+      - run: PYTHONPATH=. DATABASE_URL=sqlite:////tmp/rights-node-migrations.db alembic upgrade head
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=sqlite:////tmp/rights-node-migrations.db alembic downgrade 0012_durable_webhooks
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=sqlite:////tmp/rights-node-migrations.db alembic upgrade head
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=sqlite:////tmp/rights-node-migrations.db alembic current
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=sqlite:////tmp/rights-node-migrations.db alembic check
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=postgresql+psycopg2://rights:rights@localhost:5432/rights_node_ci alembic upgrade head
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=postgresql+psycopg2://rights:rights@localhost:5432/rights_node_ci alembic downgrade 0012_durable_webhooks
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=postgresql+psycopg2://rights:rights@localhost:5432/rights_node_ci alembic upgrade head
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=postgresql+psycopg2://rights:rights@localhost:5432/rights_node_ci alembic current
+        working-directory: backend
+      - run: PYTHONPATH=. DATABASE_URL=postgresql+psycopg2://rights:rights@localhost:5432/rights_node_ci alembic check
+        working-directory: backend
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm audit --omit=dev --audit-level=moderate
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp env.demo.sample .env
+      - run: docker compose up --build --detach --wait
+      - run: curl --fail --silent http://127.0.0.1:9247/health
+      - run: curl --fail --silent http://127.0.0.1:6482/api/health
+      - if: always()
+        run: docker compose down --volumes

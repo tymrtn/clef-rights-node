@@ -1,0 +1,121 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-rights_console}
+      - POSTGRES_USER=${POSTGRES_USER:-rights}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rights}
+    ports:
+      - "${POSTGRES_PORT:-5446}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rights} -d ${POSTGRES_DB:-rights_console}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://rights:rights@db:5432/rights_console}
+      - PORT=${PORT:-9247}
+      - CONSOLE_BASE_URL=${CONSOLE_BASE_URL:-http://localhost:6482}
+      - DEMO_MODE=${DEMO_MODE:-false}
+      - MOCK_INTEGRATIONS=${MOCK_INTEGRATIONS:-false}
+      - ALLOW_DEV_IDENTITY_HEADERS=${ALLOW_DEV_IDENTITY_HEADERS:-false}
+    volumes:
+      - ${DDEX_SCHEMA_DIR:-./var/ddex/mwl-1.0.1}:/run/secrets/ddex:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9247/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    ports:
+      - "9247:9247"
+
+  webhook-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "webhook_worker.py"]
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://rights:rights@db:5432/rights_console}
+      - DEMO_MODE=${DEMO_MODE:-false}
+      - MOCK_INTEGRATIONS=${MOCK_INTEGRATIONS:-false}
+      - ALLOW_DEV_IDENTITY_HEADERS=${ALLOW_DEV_IDENTITY_HEADERS:-false}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  expiry-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command:
+      - python
+      - expiry_worker.py
+      - --heartbeat-file
+      - /tmp/clef-expiry-worker-heartbeat.json
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://rights:rights@db:5432/rights_console}
+      - DEMO_MODE=${DEMO_MODE:-false}
+      - MOCK_INTEGRATIONS=${MOCK_INTEGRATIONS:-false}
+      - ALLOW_DEV_IDENTITY_HEADERS=${ALLOW_DEV_IDENTITY_HEADERS:-false}
+      - EXPIRY_WORKER_INTERVAL_SECONDS=${EXPIRY_WORKER_INTERVAL_SECONDS:-86400}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "from expiry_worker import configured_interval_seconds, heartbeat_is_fresh; raise SystemExit(0 if heartbeat_is_fresh('/tmp/clef-expiry-worker-heartbeat.json', maximum_age_seconds=configured_interval_seconds() + 300) else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-/api}
+        VITE_DEMO_MODE: ${VITE_DEMO_MODE:-false}
+    env_file:
+      - .env
+    environment:
+      - PORT=80
+      - API_UPSTREAM=${API_UPSTREAM:-http://api:9247}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    ports:
+      - "${CONSOLE_PORT:-6482}:80"
+
+volumes:
+  db-data:
