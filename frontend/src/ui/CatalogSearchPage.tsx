@@ -34,7 +34,7 @@ export function CatalogSearchPage({ onSelect, artistName }: Props) {
     try {
       let rows: any[] = []
 
-      // MLC recordings API requires both artist AND title
+      // The MLC recordings API requires both artist AND title
       if (artist && title) {
         const res = await fetch('/api/mlc/search/recordings', {
           method: 'POST',
@@ -73,7 +73,7 @@ export function CatalogSearchPage({ onSelect, artistName }: Props) {
   return (
     <div id="catalog-search-page" className="space-y-6">
       <div id="search-header" className="bg-white rounded-lg shadow-sm p-6">
-        <h2 className="text-xl font-semibold text-gray-900 mb-4">MLC Catalog Search</h2>
+        <h2 className="text-xl font-semibold text-gray-900 mb-4">The MLC Catalog Search</h2>
 
         {/* Search constraints info */}
         <div id="search-info" className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">

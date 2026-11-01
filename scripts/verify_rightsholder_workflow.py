@@ -20,11 +20,15 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 
 
-def configure_environment(database_path: Path, operator_email: str) -> None:
+def configure_environment(database_path: Path, operator_email: str, *, database_url: str | None = None) -> None:
     signing_key = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
     values = {
         "APP_ENV": "test",
-        "DATABASE_URL": f"sqlite:///{database_path}",
+        "NODE_DEPLOYMENT_MODE": "local_evaluation",
+        "AUTH_SIGNUP_MODE": "open",
+        "SANDBOX_GUEST_ACCESS": "false",
+        "NOTIFICATION_PROVIDER": "disabled",
+        "DATABASE_URL": database_url or f"sqlite:///{database_path}",
         "DEMO_MODE": "false",
         "MOCK_INTEGRATIONS": "false",
         "ALLOW_DEV_IDENTITY_HEADERS": "false",
@@ -51,15 +55,64 @@ class WorkflowFailure(RuntimeError):
     pass
 
 
-def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> dict:
-    configure_environment(database_path, emails["operator"])
+def require_metadata_checks(checks: dict, expected_fields: dict) -> None:
+    matches = checks.get("metadataExactMatches")
+    if not isinstance(matches, dict) or not expected_fields or any(matches.get(key) is not True for key in expected_fields):
+        raise WorkflowFailure("Publication evidence did not compare every required metadata field")
+
+
+def require_permission_audit(events: list[dict], approval_credential_id: str) -> None:
+    required = {"permission_request.created", "permission_request.approved"}
+    if not required.issubset({event["action"] for event in events}):
+        raise WorkflowFailure("Organization audit did not preserve the machine permission transaction")
+    if not any(event["action"] == "permission_request.approved" and event["actor"].get("credentialId") == approval_credential_id for event in events):
+        raise WorkflowFailure("Organization audit did not preserve the rightsholder machine actor")
+
+
+def require_empty_postgres(database_url: str) -> None:
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        url = make_url(database_url)
+        if url.drivername != "postgresql+psycopg2" or not url.database:
+            raise WorkflowFailure("Use a dedicated empty postgresql+psycopg2 test database")
+        engine = create_engine(url, connect_args={"connect_timeout": 10})
+        try:
+            with engine.connect() as connection:
+                existing = connection.execute(text("""
+                    SELECT EXISTS (
+                      SELECT 1 FROM pg_namespace n
+                      WHERE n.nspname !~ '^pg_'
+                        AND n.nspname <> 'information_schema'
+                        AND (
+                          n.nspname <> 'public'
+                          OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = n.oid)
+                          OR EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = n.oid)
+                          OR EXISTS (SELECT 1 FROM pg_type t WHERE t.typnamespace = n.oid)
+                        )
+                    )
+                """)).scalar_one()
+                if existing:
+                    raise WorkflowFailure("PostgreSQL workflow requires an empty test database; existing objects were found")
+        finally:
+            engine.dispose()
+    except (SQLAlchemyError, ValueError) as error:
+        raise WorkflowFailure("Could not validate the PostgreSQL test database; check its URL and access") from error
+
+
+def run_workflow(database_path: Path, prefix: str, emails: dict[str, str], *, database_url: str | None = None) -> dict:
+    if database_url:
+        require_empty_postgres(database_url)
+    configure_environment(database_path, emails["operator"], database_url=database_url)
 
     from alembic import command  # noqa: PLC0415
     from alembic.config import Config  # noqa: PLC0415
 
     migration_config = Config(str(BACKEND / "alembic.ini"))
     migration_config.set_main_option("script_location", str(BACKEND / "alembic"))
-    migration_config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
+    # alembic/env.py reads DATABASE_URL directly, preserving percent-encoded URLs.
     command.upgrade(migration_config, "head")
 
     from fastapi.testclient import TestClient  # noqa: PLC0415
@@ -249,13 +302,13 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
         f"/v1/organizations/{rightsholder_org['id']}/catalog/imports/{catalog_preview['id']}/commit",
         expected=422,
         headers=rightsholder_machine_headers,
-        json={"confirm_import": False},
+        json={"confirm_import": False, "expected_preview_digest": catalog_preview["previewDigest"]},
     )
     catalog_commit = request(
         "POST",
         f"/v1/organizations/{rightsholder_org['id']}/catalog/imports/{catalog_preview['id']}/commit",
         headers=rightsholder_machine_headers,
-        json={"confirm_import": True},
+        json={"confirm_import": True, "expected_preview_digest": catalog_preview["previewDigest"]},
     ).json()
     record(
         "catalog_preview_commit",
@@ -280,17 +333,17 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
     correction_row = correction_preview["rows"][0]
     if correction_row["status"] != "conflict" or correction_row["existingAsset"]["version"] != 1:
         raise WorkflowFailure("Catalog correction did not require explicit conflict resolution")
-    request(
+    resolution_response = request(
         "POST",
         f"/v1/organizations/{rightsholder_org['id']}/catalog/imports/{correction_preview['id']}/rows/{correction_row['id']}/resolution",
         headers=rightsholder_machine_headers,
-        json={"resolution": "new_version", "note": "Final executed catalog schedule corrected the provisional title"},
+        json={"expected_preview_digest": correction_preview["previewDigest"], "resolution": "new_version", "note": "Final executed catalog schedule corrected the provisional title"},
     )
     request(
         "POST",
         f"/v1/organizations/{rightsholder_org['id']}/catalog/imports/{correction_preview['id']}/commit",
         headers=rightsholder_machine_headers,
-        json={"confirm_import": True},
+        json={"confirm_import": True, "expected_preview_digest": resolution_response.json()["previewDigest"]},
     )
     catalog_history = request(
         "GET",
@@ -435,7 +488,7 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
             "territory": "US",
             "term_start": term_start.isoformat(),
             "term_end": term_end.isoformat(),
-            "context": {"releaseTitle": "Workflow Remix"},
+            "context": {"restrictionCategories": [],"releaseTitle": "Workflow Remix"},
             "provenance": {"sourceAssetDigest": "sha256:workflow-fixture"},
         },
     ).json()
@@ -481,7 +534,7 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
         decisionActor="api_credential",
     )
 
-    stored_receipt = request("GET", f"/v1/receipts/{receipt_id}").json()
+    stored_receipt = request("GET", f"/v1/receipts/{receipt_id}", headers=requester_headers).json()
     verification = request("POST", "/v1/receipts/verify", json={"receipt": stored_receipt}).json()
     if not all(verification[key] for key in ("valid", "payloadHashValid", "signatureValid", "transparencyHashValid")):
         raise WorkflowFailure(f"Issued receipt did not verify: {verification}")
@@ -608,7 +661,7 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
         raise WorkflowFailure("Balanced payment and payouts did not produce a paid reconciliation")
     if settled["assertionType"] != "paid" or not settled["reconciliationCurrent"] or not settled["totals"]["balanced"]:
         raise WorkflowFailure("The settlement read model did not preserve the current paid assertion")
-    reconciliation_receipt = request("GET", f"/v1/receipts/{reconciliation['receiptId']}").json()
+    reconciliation_receipt = request("GET", f"/v1/receipts/{reconciliation['receiptId']}", headers=requester_headers).json()
     reconciliation_verification = request(
         "POST",
         "/v1/receipts/verify",
@@ -650,7 +703,7 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
             "territory": "US",
             "term_start": term_start.isoformat(),
             "term_end": term_end.isoformat(),
-            "context": {"releaseTitle": "Workflow Grounding Study", "aiUse": ai_use},
+            "context": {"restrictionCategories": [],"releaseTitle": "Workflow Grounding Study", "aiUse": ai_use},
             "provenance": {"sourceAssetDigest": "sha256:workflow-ai-fixture"},
         },
     ).json()
@@ -770,8 +823,7 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
         raise WorkflowFailure("Publication evidence did not compare exact credit and backlink terms")
     if checks.get("reportedWithinDeadline") is not True:
         raise WorkflowFailure("Publication evidence was not recorded inside the signed reporting deadline")
-    if not all(checks.get("metadataExactMatches", {}).values()):
-        raise WorkflowFailure("Publication evidence did not compare every required metadata field")
+    require_metadata_checks(checks, ai_metadata)
     request(
         "POST",
         f"/v1/permission-usage-reports/{usage_report['id']}/reviews",
@@ -868,12 +920,17 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
 
     head = request("GET", "/v1/transparency/head").json()
     entries = request("GET", "/v1/transparency/entries").json()["entries"]
-    if head["sequence"] != 5 or head["receiptId"] != revocation_receipt["payload"]["receiptId"] or len(entries) != 5:
+    if head["sequence"] != 5 or head["entryHash"] != revocation_receipt["transparency"]["entryHash"] or len(entries) != 5:
         raise WorkflowFailure("Transparency head and entries do not match the issued receipt")
     if entries[0]["previousEntryHash"] is not None or any(entries[index]["previousEntryHash"] != entries[index - 1]["entryHash"] for index in range(1, 5)) or entries[-1]["entryHash"] != head["entryHash"]:
         raise WorkflowFailure("Transparency chain linkage is invalid")
-    if [entry["receiptKind"] for entry in entries] != ["grant", "settlement_reconciliation", "grant", "dispute", "revocation"]:
-        raise WorkflowFailure("Transparency chain did not preserve permission, settlement, and lifecycle record types")
+    issued_receipts = [stored_receipt, reconciliation_receipt, ai_receipt, dispute_receipt, revocation_receipt]
+    if entries != [issued["transparency"] for issued in issued_receipts]:
+        raise WorkflowFailure("Public hash chain does not match the privately retrieved signed receipts")
+    for issued in issued_receipts:
+        private_url = f"/v1/receipts/{issued['payload']['receiptId']}"
+        if client.get(private_url).status_code != 401:
+            raise WorkflowFailure("Anonymous receipt retrieval must require authentication")
     record("transparency_chain", sequence=5, entryHash=head["entryHash"], genesisLinked=True)
 
     requester_audit = request(
@@ -884,10 +941,7 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
     operator_audit = request("GET", "/v1/operator/audit-events", headers=operator_headers).json()["events"]
     request_events = [event for event in requester_audit if event["resource"].get("id") == permission["id"]]
     settlement_events = [event for event in requester_audit if event["details"].get("settlementId") == settlement["id"]]
-    if {event["action"] for event in request_events} < {"permission_request.created", "permission_request.approved"}:
-        raise WorkflowFailure("Organization audit did not preserve the machine permission transaction")
-    if not any(event["actor"].get("credentialId") == rightsholder_credential["id"] for event in request_events):
-        raise WorkflowFailure("Organization audit did not preserve the rightsholder machine actor")
+    require_permission_audit(request_events, rightsholder_credential["id"])
     if not any(event["action"] == "authority_claim.verified" for event in operator_audit):
         raise WorkflowFailure("Node operator audit did not preserve authority verification")
     if not any(event["action"] == "settlement.reconciliation.recorded" and event["details"].get("assertionType") == "paid" for event in settlement_events):
@@ -928,7 +982,7 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
         "receipt": {
             "id": receipt_id,
             "payloadHash": stored_receipt["proof"]["payloadHash"],
-            "entryHash": head["entryHash"],
+            "entryHash": stored_receipt["transparency"]["entryHash"],
         },
         "aiReceipt": {"id": ai_receipt_id, "payloadHash": ai_receipt["proof"]["payloadHash"]},
         "lifecycleReceipts": {
@@ -947,7 +1001,9 @@ def run_workflow(database_path: Path, prefix: str, emails: dict[str, str]) -> di
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database-path", type=Path, help="Fresh SQLite path; defaults to a temporary database")
+    database = parser.add_mutually_exclusive_group()
+    database.add_argument("--database-path", type=Path, help="Fresh SQLite path; defaults to a temporary database")
+    database.add_argument("--postgres-test-url-env", help="Environment variable holding a dedicated empty PostgreSQL test URL; the workflow creates synthetic records and retains them")
     parser.add_argument("--output", type=Path, help="Optional JSON evidence output path")
     parser.add_argument("--prefix", default="e2e", help="Slug/work identifier prefix")
     parser.add_argument("--operator-email", default="operator@workflow.test")
@@ -959,6 +1015,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    database_url = None
+    if args.postgres_test_url_env:
+        database_url = os.environ.get(args.postgres_test_url_env)
+        if not database_url:
+            raise SystemExit("The PostgreSQL test URL environment variable is empty")
     temporary: tempfile.TemporaryDirectory[str] | None = None
     if args.database_path:
         database_path = args.database_path.expanduser().resolve()
@@ -976,7 +1037,8 @@ def main() -> int:
         "client": args.client_email.strip().lower(),
     }
     try:
-        result = run_workflow(database_path, args.prefix.strip().lower(), emails)
+        result = run_workflow(database_path, args.prefix.strip().lower(), emails, database_url=database_url)
+        result["databaseDialect"] = "postgresql" if database_url else "sqlite"
         rendered = json.dumps(result, indent=2, sort_keys=True)
         if args.output:
             args.output.expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)

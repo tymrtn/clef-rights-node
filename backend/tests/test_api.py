@@ -79,6 +79,46 @@ def test_organization_onboarding_persists_conservative_ai_defaults():
     assert session_profile == profile
 
 
+@pytest.mark.parametrize(
+    ("organization_type", "expected_rights"),
+    [
+        ("label", ["master"]),
+        ("publisher", ["composition", "lyrics"]),
+        ("administrator", ["composition", "master"]),
+        ("pro", ["composition", "performance"]),
+        ("cmo", ["composition", "performance"]),
+        ("requester", []),
+    ],
+)
+def test_organization_type_supplies_conservative_rights_defaults_when_omitted(organization_type, expected_rights):
+    prefix = f"typed-default-{organization_type}-{uuid.uuid4().hex[:8]}"
+    headers = _session_headers(f"{prefix}@example.com")
+    response = client.post(
+        "/v1/organizations",
+        json={"slug": prefix, "name": f"Typed {organization_type}", "organization_type": organization_type},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["profile"]["controlledRightTypes"] == expected_rights
+
+
+def test_requester_cannot_submit_contradictory_controlled_rights():
+    prefix = f"requester-rights-{uuid.uuid4().hex[:8]}"
+    headers = _session_headers(f"{prefix}@example.com")
+    response = client.post(
+        "/v1/organizations",
+        json={
+            "slug": prefix,
+            "name": "Contradictory Requester",
+            "organization_type": "requester",
+            "controlled_right_types": ["master"],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Requester organizations cannot select controlled rights"
+
+
 @pytest.mark.parametrize("organization_type", ["label", "publisher", "administrator", "pro", "cmo", "collective"])
 def test_rights_administration_organizations_can_onboard_without_inventing_authority(organization_type):
     prefix = f"admin-{organization_type}-{uuid.uuid4().hex[:8]}"
@@ -125,6 +165,74 @@ def test_requester_onboarding_does_not_invent_catalog_authority():
     )
     assert publish.status_code == 403
     assert publish.json()["detail"] == "Requester organizations cannot publish rights policies"
+
+
+def test_onboarding_status_is_role_scoped_and_never_promotes_setup_to_authority():
+    prefix = f"status-{uuid.uuid4().hex[:8]}"
+    owner_headers = _session_headers(f"owner-{prefix}@example.com")
+    organization = client.post(
+        "/v1/organizations",
+        json={
+            "slug": prefix,
+            "name": "Onboarding Status Label",
+            "organization_type": "label",
+            "controlled_right_types": ["master"],
+        },
+        headers=owner_headers,
+    ).json()
+    response = client.get(
+        f"/v1/organizations/{organization['id']}/onboarding-status",
+        headers=owner_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    milestones = {row["key"]: row for row in body["milestones"]}
+    assert body["complete"] is False
+    assert milestones["catalog"]["status"] == "pending"
+    assert milestones["policy"]["status"] == "pending"
+    assert milestones["authority"]["status"] == "pending"
+    assert milestones["reviewer"]["status"] == "complete"
+    assert client.get(
+        f"/v1/organizations/{organization['id']}/authority-claims",
+        headers=owner_headers,
+    ).json()["claims"] == []
+
+    member_email = f"member-{prefix}@example.com"
+    assert client.post(
+        f"/v1/organizations/{organization['id']}/members",
+        json={"email": member_email, "role": "member"},
+        headers=owner_headers,
+    ).status_code == 200
+    forbidden = client.get(
+        f"/v1/organizations/{organization['id']}/onboarding-status",
+        headers=_session_headers(member_email),
+    )
+    assert forbidden.status_code == 403
+
+
+def test_requester_onboarding_status_marks_rightsholder_steps_not_applicable():
+    prefix = f"requester-status-{uuid.uuid4().hex[:8]}"
+    headers = _session_headers(f"{prefix}@example.com")
+    organization = client.post(
+        "/v1/organizations",
+        json={
+            "slug": prefix,
+            "name": "Permission Requester",
+            "organization_type": "requester",
+            "controlled_right_types": [],
+        },
+        headers=headers,
+    ).json()
+    response = client.get(
+        f"/v1/organizations/{organization['id']}/onboarding-status",
+        headers=headers,
+    )
+    assert response.status_code == 200
+    milestones = {row["key"]: row for row in response.json()["milestones"]}
+    assert milestones["catalog"]["status"] == "not_applicable"
+    assert milestones["policy"]["status"] == "not_applicable"
+    assert milestones["authority"]["status"] == "not_applicable"
+    assert milestones["requester"]["status"] == "pending"
 
 
 def test_label_owner_can_add_client_team_members_without_granting_node_admin():
@@ -208,13 +316,13 @@ def test_label_catalog_import_is_previewed_versioned_and_not_authority():
 
     unconfirmed = client.post(
         f"/v1/organizations/{org_id}/catalog/imports/{batch['id']}/commit",
-        json={"confirm_import": False},
+        json={"confirm_import": False, "expected_preview_digest": batch["previewDigest"]},
         headers=headers,
     )
     assert unconfirmed.status_code == 422
     committed = client.post(
         f"/v1/organizations/{org_id}/catalog/imports/{batch['id']}/commit",
-        json={"confirm_import": True},
+        json={"confirm_import": True, "expected_preview_digest": batch["previewDigest"]},
         headers=headers,
     )
     assert committed.status_code == 200, committed.text
@@ -253,20 +361,20 @@ def test_label_catalog_import_is_previewed_versioned_and_not_authority():
 
     blocked_commit = client.post(
         f"/v1/organizations/{org_id}/catalog/imports/{conflict_batch['id']}/commit",
-        json={"confirm_import": True},
+        json={"confirm_import": True, "expected_preview_digest": conflict_batch["previewDigest"]},
         headers=headers,
     )
     assert blocked_commit.status_code == 409
     resolved = client.post(
         f"/v1/organizations/{org_id}/catalog/imports/{conflict_batch['id']}/rows/{conflict_row['id']}/resolution",
-        json={"resolution": "new_version", "note": "Corrected title against the executed catalog addendum"},
+        json={"expected_preview_digest": conflict_batch["previewDigest"], "resolution": "new_version", "note": "Corrected title against the executed catalog addendum"},
         headers=headers,
     )
     assert resolved.status_code == 200, resolved.text
     assert resolved.json()["status"] == "resolved_version"
     second_commit = client.post(
         f"/v1/organizations/{org_id}/catalog/imports/{conflict_batch['id']}/commit",
-        json={"confirm_import": True},
+        json={"confirm_import": True, "expected_preview_digest": resolved.json()["previewDigest"]},
         headers=headers,
     )
     assert second_commit.status_code == 200, second_commit.text
@@ -305,7 +413,7 @@ def test_catalog_import_rejects_title_identifiers_and_unknown_clients():
     assert "does not match a managed client" in " ".join(row["errors"])
     commit = client.post(
         f"/v1/organizations/{org_id}/catalog/imports/{preview.json()['id']}/commit",
-        json={"confirm_import": True},
+        json={"confirm_import": True, "expected_preview_digest": preview.json()["previewDigest"]},
         headers=headers,
     )
     assert commit.status_code == 409
@@ -415,6 +523,7 @@ def test_rights_save_and_history_roundtrip():
 
 
 def test_verified_authority_permission_receipt_roundtrip():
+    initial_sequence = client.get("/v1/transparency/head").json()["sequence"]
     rightsholder_headers = _session_headers("rights@example.com")
     requester_headers = _session_headers("requester@example.com")
     operator_headers = _session_headers("operator@example.com", role="admin")
@@ -525,7 +634,7 @@ def test_verified_authority_permission_receipt_roundtrip():
     receipt = decision.json()["receipt"]
     assert receipt["payload"]["status"] == "permissioned"
     assert receipt["payload"]["authority"]["verificationStatus"] == "verified"
-    assert receipt["transparency"]["sequence"] == 1
+    assert receipt["transparency"]["sequence"] == initial_sequence + 1
     first_entry_hash = receipt["transparency"]["entryHash"]
 
     verification = client.post("/v1/receipts/verify", json={"receipt": receipt})
@@ -573,16 +682,16 @@ def test_verified_authority_permission_receipt_roundtrip():
     assert auto_permission.status_code == 200
     assert auto_permission.json()["status"] == "approved"
     second_receipt = auto_permission.json()["receipt"]
-    assert second_receipt["transparency"]["sequence"] == 2
+    assert second_receipt["transparency"]["sequence"] == initial_sequence + 2
     assert second_receipt["transparency"]["previousEntryHash"] == first_entry_hash
 
     head = client.get("/v1/transparency/head")
     assert head.status_code == 200
-    assert head.json()["sequence"] == 2
+    assert head.json()["sequence"] == initial_sequence + 2
 
-    entries = client.get("/v1/transparency/entries")
+    entries = client.get("/v1/transparency/entries", params={"from_sequence": initial_sequence + 1})
     assert entries.status_code == 200
-    assert [entry["sequence"] for entry in entries.json()["entries"]] == [1, 2]
+    assert [entry["sequence"] for entry in entries.json()["entries"]] == [initial_sequence + 1, initial_sequence + 2]
     assert entries.json()["entries"][1]["previousEntryHash"] == entries.json()["entries"][0]["entryHash"]
 
 
@@ -688,7 +797,7 @@ def test_ai_grounding_scope_limits_and_assets_are_enforced_and_receipted():
             "territory": "US",
             "term_start": "2026-08-01",
             "term_end": "2027-07-31",
-            "context": {"releaseTitle": "Grounded Session", "aiUse": ai_use},
+            "context": {"releaseTitle": "Grounded Session", "restrictionCategories": [], "aiUse": ai_use},
         },
         headers=requester_headers,
     )
@@ -749,6 +858,7 @@ def test_ai_grounding_scope_limits_and_assets_are_enforced_and_receipted():
             "requester_org_id": requester_org["id"],
             "authority_claim_id": claim["id"],
             "intended_usage": "ai_grounded_generation",
+            "territory": "US",
             "term_start": "2026-08-01",
             "term_end": "2027-07-31",
             "context": {"aiUse": {**ai_use, "sourceDurationSeconds": 31}},
@@ -875,23 +985,23 @@ def test_webhook_signatures_are_tamper_evident_and_time_bounded():
         payload={"permissionId": "permission-1", "decision": "approved"},
         occurred_at="2026-07-10T12:00:00Z",
     )
-    signature = webhook_signature(secret="test-webhook-secret", timestamp=1000, body=body)
+    signature = webhook_signature(secret="fixture-test-webhook-secret", timestamp=1000, body=body)
     assert verify_webhook_signature(
-        secret="test-webhook-secret",
+        secret="fixture-test-webhook-secret",
         timestamp=1000,
         body=body,
         signature=signature,
         now=1000,
     )
     assert not verify_webhook_signature(
-        secret="test-webhook-secret",
+        secret="fixture-test-webhook-secret",
         timestamp=1000,
         body=body + b" ",
         signature=signature,
         now=1000,
     )
     assert not verify_webhook_signature(
-        secret="test-webhook-secret",
+        secret="fixture-test-webhook-secret",
         timestamp=1000,
         body=body,
         signature=signature,
@@ -1079,6 +1189,13 @@ def test_organization_mlc_lookup_supports_scoped_machine_access_and_audit(monkey
     assert response.json()["assertionType"] == "observed"
     assert response.json()["permissionStatus"] == "unknown"
     assert response.json()["results"][0]["mlcSongCode"] == "MLC-OBSERVED-1"
+    scope = response.json()["sourceScope"]
+    assert scope["providerName"] == "The MLC"
+    assert scope["publishingAdministrationTerritory"] == "US"
+    assert scope["recordingMetadataSource"] == "digital_service_providers"
+    assert scope["masterOwnershipEvidenceProvided"] is False
+    assert scope["masterRightsSharesProvided"] is False
+    assert scope["permissionAuthoritySource"] == "separately_reviewed_rightsholder_evidence"
     assert observed.calls == [("Observed Work", None)]
 
     audit = client.get(
@@ -1140,7 +1257,7 @@ def test_production_configuration_requires_email_delivery(monkeypatch):
     monkeypatch.setenv("MOCK_INTEGRATIONS", "false")
     monkeypatch.setenv("ALLOW_DEV_IDENTITY_HEADERS", "false")
     monkeypatch.setenv("ALLOW_DEV_MAGIC_LINKS", "false")
-    monkeypatch.setenv("RIGHTS_MAGIC_LINK_SECRET", "a-production-secret-with-32-characters")
+    monkeypatch.setenv("RIGHTS_MAGIC_LINK_SECRET", "fixture-a-production-secret-with-32-characters")
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg2://rights:secret@db/rights")
     monkeypatch.setenv("NODE_OPERATOR_EMAILS", "operator@example.com")
     monkeypatch.setenv("CORS_ALLOW_ORIGINS", "https://rights.example.com")
@@ -1155,7 +1272,7 @@ def test_production_configuration_requires_separate_webhook_encryption_key(monke
     monkeypatch.setenv("MOCK_INTEGRATIONS", "false")
     monkeypatch.setenv("ALLOW_DEV_IDENTITY_HEADERS", "false")
     monkeypatch.setenv("ALLOW_DEV_MAGIC_LINKS", "false")
-    monkeypatch.setenv("RIGHTS_MAGIC_LINK_SECRET", "a-production-secret-with-32-characters")
+    monkeypatch.setenv("RIGHTS_MAGIC_LINK_SECRET", "fixture-a-production-secret-with-32-characters")
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg2://rights:secret@db/rights")
     monkeypatch.setenv("NODE_OPERATOR_EMAILS", "operator@example.com")
     monkeypatch.setenv("CORS_ALLOW_ORIGINS", "https://rights.example.com")
@@ -1173,7 +1290,7 @@ def test_production_mlc_connector_requires_complete_credentials_and_https(monkey
     monkeypatch.setenv("MOCK_INTEGRATIONS", "false")
     monkeypatch.setenv("ALLOW_DEV_IDENTITY_HEADERS", "false")
     monkeypatch.setenv("ALLOW_DEV_MAGIC_LINKS", "false")
-    monkeypatch.setenv("RIGHTS_MAGIC_LINK_SECRET", "a-production-secret-with-32-characters")
+    monkeypatch.setenv("RIGHTS_MAGIC_LINK_SECRET", "fixture-a-production-secret-with-32-characters")
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg2://rights:secret@db/rights")
     monkeypatch.setenv("NODE_OPERATOR_EMAILS", "operator@example.com")
     monkeypatch.setenv("CORS_ALLOW_ORIGINS", "https://rights.example.com")
@@ -1181,8 +1298,8 @@ def test_production_mlc_connector_requires_complete_credentials_and_https(monkey
     monkeypatch.setenv("MAILGUN_DOMAIN", "mail.rights.example.com")
     monkeypatch.setenv("WEBHOOK_ENCRYPTION_KEY_B64", "configured-separate-key")
     monkeypatch.setenv("WEBHOOK_ALLOW_PRIVATE_TARGETS", "false")
-    monkeypatch.setenv("SOURCE_CODE_URL", "https://source.example.com/clef-rights-node/v1.0.0")
-    monkeypatch.setenv("SOURCE_CODE_REVISION", "v1.0.0")
+    monkeypatch.setenv("SOURCE_CODE_URL", "https://source.example.com/clef-rights-node/0123456789abcdef0123456789abcdef01234567")
+    monkeypatch.setenv("SOURCE_CODE_REVISION", "0123456789abcdef0123456789abcdef01234567")
     monkeypatch.setenv("MLC_ENABLED", "true")
     monkeypatch.delenv("MLC_USERNAME", raising=False)
     monkeypatch.delenv("MLC_PASSWORD", raising=False)
@@ -1202,7 +1319,7 @@ def test_production_configuration_requires_a_corresponding_source_offer(monkeypa
     monkeypatch.setenv("MOCK_INTEGRATIONS", "false")
     monkeypatch.setenv("ALLOW_DEV_IDENTITY_HEADERS", "false")
     monkeypatch.setenv("ALLOW_DEV_MAGIC_LINKS", "false")
-    monkeypatch.setenv("RIGHTS_MAGIC_LINK_SECRET", "a-production-secret-with-32-characters")
+    monkeypatch.setenv("RIGHTS_MAGIC_LINK_SECRET", "fixture-a-production-secret-with-32-characters")
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg2://rights:secret@db/rights")
     monkeypatch.setenv("NODE_OPERATOR_EMAILS", "operator@example.com")
     monkeypatch.setenv("CORS_ALLOW_ORIGINS", "https://rights.example.com")
@@ -1216,9 +1333,15 @@ def test_production_configuration_requires_a_corresponding_source_offer(monkeypa
         Settings()
 
     monkeypatch.setenv("SOURCE_CODE_URL", "http://source.example.com/clef-rights-node")
-    monkeypatch.setenv("SOURCE_CODE_REVISION", "v1.0.0")
+    monkeypatch.setenv("SOURCE_CODE_REVISION", "0123456789abcdef0123456789abcdef01234567")
     with pytest.raises(RuntimeError, match="SOURCE_CODE_URL must be an HTTPS URL"):
         Settings()
+
+    monkeypatch.setenv("SOURCE_CODE_URL", "https://source.example.com/clef-rights-node/0123456789abcdef0123456789abcdef01234567")
+    for revision in ("release-branch", "v1.0.0", "0123456", "a" * 40):
+        monkeypatch.setenv("SOURCE_CODE_REVISION", revision)
+        with pytest.raises(RuntimeError, match="full Git commit hash named in SOURCE_CODE_URL"):
+            Settings()
 
 
 def test_node_info_discloses_license_and_running_source_revision():
@@ -1230,6 +1353,33 @@ def test_node_info_discloses_license_and_running_source_revision():
     assert response.json()["webhookDeliveryEnabled"] == settings.WEBHOOK_DELIVERY_ENABLED
     assert response.json()["sourceCodeRevision"] == settings.SOURCE_CODE_REVISION
     assert "sourceCodeUrl" in response.json()
+
+
+def test_node_readiness_is_operator_only_and_contains_no_credentials():
+    denied = client.get(
+        "/v1/node/readiness",
+        headers=_session_headers(f"member-{uuid.uuid4().hex[:8]}@example.com"),
+    )
+    assert denied.status_code == 403
+
+    response = client.get(
+        "/v1/node/readiness",
+        headers=_session_headers("operator@example.com", role="admin"),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deploymentMode"] == settings.NODE_DEPLOYMENT_MODE
+    assert {row["key"] for row in body["checks"]} >= {
+        "database_migrations",
+        "receipt_signing_key",
+        "expiry_worker",
+        "webhook_worker",
+        "mlc_adapter",
+        "ddex_adapter",
+    }
+    serialized = response.text.lower()
+    assert "password" not in serialized
+    assert "api_key" not in serialized
 
 
 def test_database_pool_checks_connections_before_checkout():
@@ -1289,14 +1439,14 @@ def test_public_sandbox_guest_profile_requires_no_email_identity(monkeypatch):
         "MOCK_INTEGRATIONS": "false",
         "ALLOW_DEV_IDENTITY_HEADERS": "false",
         "ALLOW_DEV_MAGIC_LINKS": "false",
-        "RIGHTS_MAGIC_LINK_SECRET": "a-production-secret-with-32-characters",
+        "RIGHTS_MAGIC_LINK_SECRET": "fixture-a-production-secret-with-32-characters",
         "DATABASE_URL": "postgresql+psycopg2://rights:secret@db/rights",
         "CORS_ALLOW_ORIGINS": "https://sandbox.example.com",
         "WEBHOOK_ENCRYPTION_KEY_B64": "configured-separate-key",
         "WEBHOOK_ALLOW_PRIVATE_TARGETS": "false",
         "WEBHOOK_DELIVERY_ENABLED": "false",
-        "SOURCE_CODE_URL": "https://source.example.com/clef-rights-node/v1.0.0",
-        "SOURCE_CODE_REVISION": "v1.0.0",
+        "SOURCE_CODE_URL": "https://source.example.com/clef-rights-node/0123456789abcdef0123456789abcdef01234567",
+        "SOURCE_CODE_REVISION": "0123456789abcdef0123456789abcdef01234567",
         "MLC_ENABLED": "false",
         "DDEX_ENABLED": "false",
         "DDEX_LIVE_MESSAGES": "false",
@@ -1815,7 +1965,8 @@ def test_operator_expiry_run_creates_one_signed_record_after_the_declared_term()
     assert expired.status_code == 200
     assert expired.json()["expiredCount"] == 1
     expiry_id = expired.json()["receipts"][0]["receiptId"]
-    receipt = client.get(f"/v1/receipts/{expiry_id}").json()
+    assert client.get(f"/v1/receipts/{expiry_id}").status_code == 401
+    receipt = client.get(f"/v1/receipts/{expiry_id}", headers=setup["requester_headers"]).json()
     assert receipt["payload"]["status"] == "expired"
     assert receipt["payload"]["event"]["type"] == "expiry"
     assert receipt["payload"]["event"]["priorReceiptId"] == grant["payload"]["receiptId"]
@@ -2056,11 +2207,21 @@ def test_ddex_mwl_refuses_derivative_scope_even_when_connector_is_available(monk
     assert "cannot represent" in response.json()["detail"]
 
 
-def test_magic_link_is_single_use_session_is_hashed_and_logout_revokes_it():
+def test_magic_link_is_single_use_session_is_hashed_and_logout_revokes_it(monkeypatch):
+    from types import SimpleNamespace
+
+    now = datetime.datetime.utcnow()
+    monkeypatch.setattr("services.auth.datetime", SimpleNamespace(
+        datetime=SimpleNamespace(utcnow=lambda: now), timedelta=datetime.timedelta,
+    ))
     email = f"magic-{uuid.uuid4()}@example.com"
     invited = client.post("/auth/invite", json={"email": email})
     assert invited.status_code == 202
     token = parse_qs(urlparse(invited.json()["devLink"]).query)["token"][0]
+    second_invite = client.post("/auth/invite", json={"email": email})
+    assert second_invite.status_code == 202
+    second_token = parse_qs(urlparse(second_invite.json()["devLink"]).query)["token"][0]
+    assert second_token != token
 
     validated = client.get("/auth/validate", params={"token": token})
     assert validated.status_code == 200
@@ -2076,6 +2237,9 @@ def test_magic_link_is_single_use_session_is_hashed_and_logout_revokes_it():
 
     replay = client.get("/auth/validate", params={"token": token})
     assert replay.status_code == 409
+    second_validation = client.get("/auth/validate", params={"token": second_token})
+    assert second_validation.status_code == 200
+    assert client.get("/auth/validate", params={"token": second_token}).status_code == 409
     session_headers = {"X-Session-Id": raw_session_id}
     current = client.get("/v1/session", headers=session_headers)
     assert current.status_code == 200
@@ -2777,7 +2941,8 @@ def test_settlement_ledger_reconciles_exact_external_payment_and_beneficiary_pay
     assert reconciled.json()["status"] == "balanced"
     assert reconciled.json()["assertionType"] == "paid"
     assert reconciled.json()["totals"]["balanced"] is True
-    reconciliation_receipt = client.get(f"/v1/receipts/{reconciled.json()['receiptId']}").json()
+    assert client.get(f"/v1/receipts/{reconciled.json()['receiptId']}").status_code == 401
+    reconciliation_receipt = client.get(f"/v1/receipts/{reconciled.json()['receiptId']}", headers=authority_bearer).json()
     assert reconciliation_receipt["payload"]["schemaVersion"] == "clef.settlement-reconciliation-receipt.v1"
     assert reconciliation_receipt["payload"]["settlement"]["ledgerDigest"] == reconciled.json()["ledgerDigest"]
     assert reconciliation_receipt["payload"]["settlement"]["assertionType"] == "paid"

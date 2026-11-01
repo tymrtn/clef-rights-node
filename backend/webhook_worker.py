@@ -11,6 +11,7 @@ import time
 
 from main import SessionLocal, settings, webhook_secret_box
 from services.webhook_outbox import process_due_webhooks
+from services.worker_heartbeat import record_service_heartbeat
 
 
 logger = logging.getLogger("clef.webhook_worker")
@@ -25,7 +26,7 @@ def _stop(*_args) -> None:
 def deliver_once(limit: int) -> dict[str, int]:
     db = SessionLocal()
     try:
-        return process_due_webhooks(
+        result = process_due_webhooks(
             db,
             secret_box=webhook_secret_box,
             allow_private_targets=settings.WEBHOOK_ALLOW_PRIVATE_TARGETS,
@@ -33,6 +34,25 @@ def deliver_once(limit: int) -> dict[str, int]:
             request_timeout_seconds=settings.WEBHOOK_REQUEST_TIMEOUT_SECONDS,
             limit=limit,
         )
+        record_service_heartbeat(
+            db,
+            service_name="webhook_worker",
+            succeeded=True,
+            details=result,
+        )
+        return result
+    except Exception as error:
+        db.rollback()
+        try:
+            record_service_heartbeat(
+                db,
+                service_name="webhook_worker",
+                succeeded=False,
+                error_type=type(error).__name__,
+            )
+        except Exception:
+            logger.exception("Could not persist webhook worker failure heartbeat")
+        raise
     finally:
         db.close()
 

@@ -5,6 +5,7 @@ from copy import deepcopy
 import csv
 import io
 import json
+import os
 import jwt
 import hashlib
 import secrets
@@ -33,13 +34,14 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from pythonjsonlogger import jsonlogger
 
-from services.mlc_client import MLCClient, MLCClientError, MLCQueryError
+from services.mlc_client import MLCClient, MLCClientError, MLCQueryError, mlc_source_scope
 from services.musicbrainz_client import MusicBrainzClient
 from services.mock_clients import MockMLCClient, MockMusicBrainzClient, mock_intent
 from services.settings import Settings
 from services.auth import MagicLinkService
 from services.intent import IntentService
-from services.notifications import send_mailgun_email, send_slack_message
+from services.notifications import notification_provider_from_settings, send_slack_message
+from services import privacy as data_privacy
 from services.receipts import (
     LIFECYCLE_SCHEMA_VERSION,
     ReceiptSigner,
@@ -59,7 +61,8 @@ from services.adapters.ddex_mwl import (
     build_license_request,
 )
 from services.webhooks import signed_webhook_body, webhook_signature
-from services.database import require_database_at_head
+from services.database import database_revision_state, require_database_at_head
+from services.readiness import HeartbeatSnapshot, ReadinessInputs, evaluate_node_readiness
 from services.webhook_outbox import (
     SUPPORTED_WEBHOOK_EVENTS,
     WebhookSecretBox,
@@ -94,6 +97,9 @@ from models import (
     PermissionUsageReportRecord,
     PermissionComplianceReviewRecord,
     PermissionReceiptRecord,
+    OrganizationPrivacyRecord,
+    ReceiptDisclosureRecord,
+    PrivacyErasureRequestRecord,
     DdexExchangeRecord,
     DdexAcknowledgementRecord,
     SettlementRecord,
@@ -109,12 +115,14 @@ from models import (
     WebhookEventRecord,
     WebhookOutboxDeliveryRecord,
     WebhookAttemptRecord,
+    ServiceHeartbeatRecord,
 )
 
-PROJECT_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+PROJECT_ENV_PATH = Path(os.getenv("CLEF_ENV_FILE") or Path(__file__).resolve().parents[1] / ".env")
 load_dotenv(dotenv_path=PROJECT_ENV_PATH, override=False)
 
 settings = Settings()
+notification_provider = notification_provider_from_settings(settings)
 webhook_secret_box = WebhookSecretBox.from_config(
     key_b64=settings.WEBHOOK_ENCRYPTION_KEY_B64,
     development_secret=settings.RIGHTS_MAGIC_LINK_SECRET,
@@ -195,6 +203,8 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def get_db():
     db = SessionLocal()
     try:
+        from sandbox_tour import fence_tour_mutation
+        fence_tour_mutation(db)
         yield db
     finally:
         db.close()
@@ -225,6 +235,20 @@ def _transparency_write_lock(db: Session):
         yield
 
 
+@contextmanager
+def _authority_write_lock(db: Session):
+    """PostgreSQL uses claim/policy row locks; SQLite serializes the whole decision.
+
+    Never acquire the PostgreSQL transparency lock before a claim row lock.
+    Grant issuance holds its claim/policy rows before allocating a log sequence.
+    """
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        yield
+    else:
+        with _LOCAL_TRANSPARENCY_LOCK:
+            yield
+
+
 mlc_adapter = MLCAdapter(
     enabled=settings.MLC_ENABLED,
     username=settings.MLC_USERNAME,
@@ -250,84 +274,8 @@ ddex_adapter = DDEXAdapter(
 
 
 # --- Helpers ---
-CORE_USAGE_KEYS = [
-    "ads_brand",
-    "ads_political",
-    "ads_psa",
-    "film_tv",
-    "streaming_visual",
-    "video_game",
-    "podcast_audio",
-    "ugc_creator",
-    "live_performance",
-    "background_music",
-    "corporate_internal",
-    "educational",
-    "personal_noncommercial",
-    "ai_training_recursive",
-    "derivative_remix",
-]
-
-AI_USAGE_KEYS = [
-    "ai_model_training",
-    "ai_model_fine_tuning",
-    "ai_grounded_generation",
-    "ai_embedding_creation",
-    "ai_embedding_retrieval",
-    "ai_source_separation",
-    "ai_music_transformation",
-    "ai_lyric_analysis",
-    "ai_lyric_generation",
-    "ai_synthetic_voice",
-]
-
-USAGE_KEYS = CORE_USAGE_KEYS + AI_USAGE_KEYS
-
-AI_INPUT_KEYS = [
-    "full_mix",
-    "stems",
-    "isolated_vocals",
-    "lyrics",
-    "composition_data",
-    "reference_embeddings",
-]
-
-AI_MODEL_SCOPE_KEYS = [
-    "private_single_tenant",
-    "shared_commercial_model",
-    "public_or_open_weights",
-]
-
-AI_LIMIT_KEYS = [
-    "maxSourceDurationSeconds",
-    "maxOutputDurationSeconds",
-    "maxLyricCharacters",
-    "sourceRetentionDays",
-    "embeddingRetentionDays",
-]
-
-AI_SAFEGUARD_KEYS = [
-    "provenanceReceipt",
-    "outputWatermark",
-    "attribution",
-    "similarityReview",
-    "deletionAttestation",
-]
-
-RESTRICTION_KEYS = [
-    "political",
-    "adult",
-    "alcohol_tobacco_cannabis",
-    "weapons_defense",
-    "gambling",
-    "religion",
-    "sensitive_social_issues",
-    "health_pharma",
-    "children_sensitive",
-    "likeness_voice_clone",
-    "deceptive_endorsement",
-]
-
+from services.policy_vocabulary import (CORE_USAGE_KEYS, AI_USAGE_KEYS, USAGE_KEYS, AI_INPUT_KEYS,
+    AI_MODEL_SCOPE_KEYS, AI_LIMIT_KEYS, AI_SAFEGUARD_KEYS, RESTRICTION_KEYS, default_ai_policy)
 
 def default_usage_matrix(value: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Initialize usage matrix with tri-state values: 'blocked', 'requires_approval', 'allowed'"""
@@ -349,21 +297,19 @@ def default_restriction_matrix(value: Optional[Dict[str, str]] = None) -> Dict[s
     return out
 
 
-def default_ai_policy(preset: str = "review_each_ai_use") -> Dict[str, Any]:
-    review = preset == "review_each_ai_use"
-    input_state = "requires_approval" if review else "blocked"
-    return {
-        "schemaVersion": "clef.ai-policy.v1",
-        "inputs": {key: input_state for key in AI_INPUT_KEYS},
-        "modelScopes": {
-            "private_single_tenant": input_state,
-            "shared_commercial_model": input_state,
-            "public_or_open_weights": "blocked",
-        },
-        # null means the value must be settled in the individual license. It never means unlimited.
-        "limits": {key: None for key in AI_LIMIT_KEYS},
-        "safeguards": {key: True for key in AI_SAFEGUARD_KEYS},
-    }
+
+
+DEFAULT_CONTROLLED_RIGHTS_BY_ORGANIZATION_TYPE = {
+    "rights_holder": ["composition"],
+    "artist": ["composition", "master", "lyrics", "performance", "voice", "likeness"],
+    "label": ["master"],
+    "publisher": ["composition", "lyrics"],
+    "administrator": ["composition", "master"],
+    "pro": ["composition", "performance"],
+    "cmo": ["composition", "performance"],
+    "collective": ["composition", "performance"],
+    "requester": [],
+}
 
 
 def default_organization_profile(
@@ -381,7 +327,11 @@ def default_organization_profile(
     return {
         "organizationType": organization_type,
         "defaultTerritory": default_territory,
-        "controlledRightTypes": controlled_right_types if controlled_right_types is not None else ["composition"],
+        "controlledRightTypes": (
+            controlled_right_types
+            if controlled_right_types is not None
+            else list(DEFAULT_CONTROLLED_RIGHTS_BY_ORGANIZATION_TYPE.get(organization_type, ["composition"]))
+        ),
         "aiPolicyPreset": ai_policy_preset,
         "policyDefaults": {
             "matrix": {"usage": usage, "restrictions": restrictions},
@@ -744,8 +694,7 @@ magic = MagicLinkService(
     secret=settings.RIGHTS_MAGIC_LINK_SECRET,
     link_exp_minutes=settings.RIGHTS_MAGIC_LINK_EXP_MINUTES,
     session_ttl_minutes=settings.RIGHTS_SESSION_TTL_MINUTES,
-    mailgun_api_key=settings.MAILGUN_API_KEY,
-    mailgun_domain=settings.MAILGUN_DOMAIN,
+    notification_provider=notification_provider,
     base_url=settings.CONSOLE_BASE_URL,
 )
 
@@ -753,7 +702,7 @@ magic = MagicLinkService(
 @app.post("/auth/invite")
 @limiter.limit("5/minute")
 def send_invite(request: Request, req: InviteRequest):
-    if not settings.MAILGUN_API_KEY and not settings.ALLOW_DEV_MAGIC_LINKS:
+    if not notification_provider.enabled and not settings.ALLOW_DEV_MAGIC_LINKS:
         raise HTTPException(status_code=503, detail="Email delivery is not configured")
     normalized_email = req.email.strip().lower()
     if settings.AUTH_SIGNUP_MODE == "operator_only" and normalized_email not in settings.NODE_OPERATOR_EMAILS:
@@ -762,7 +711,7 @@ def send_invite(request: Request, req: InviteRequest):
         return JSONResponse(status_code=202, content={"ok": True, "sent": True})
     try:
         link = magic.create_and_send_link(normalized_email)
-        response = {"ok": True, "sent": bool(settings.MAILGUN_API_KEY)}
+        response = {"ok": True, "sent": notification_provider.enabled}
         if settings.ALLOW_DEV_MAGIC_LINKS:
             response["devLink"] = link
         return JSONResponse(status_code=202, content=response)
@@ -2534,15 +2483,12 @@ def create_claim(
     db.commit()
     db.refresh(claim)
     _audit(db, owner_email=owner, actor_email=req.claimant_email, action="claim.create", key=req.key, entity_id=claim.id, details={"note": req.note})
-    # Email-based verification link (optional: uses Mailgun if configured)
+    # Email-based verification link (optional: uses the configured provider)
     exp = datetime.datetime.utcnow() + datetime.timedelta(minutes=settings.RIGHTS_MAGIC_LINK_EXP_MINUTES)
     token = jwt.encode({"claim_id": claim.id, "email": req.claimant_email, "exp": exp}, settings.RIGHTS_MAGIC_LINK_SECRET, algorithm="HS256")
     link = f"{settings.CONSOLE_BASE_URL}/claims/verify?token={token}"
     try:
-        send_mailgun_email(
-            mailgun_api_key=settings.MAILGUN_API_KEY,
-            mailgun_domain=settings.MAILGUN_DOMAIN,
-            from_email=f"Clef Rights <console@{settings.MAILGUN_DOMAIN}>",
+        notification_provider.send(
             to_emails=[req.claimant_email],
             subject="Verify your work claim",
             text=f"Verify your claim for key {req.key}: {link}\n\nIf you did not request this, ignore this email.",
@@ -2623,10 +2569,7 @@ def approvals_request(
     except Exception:
         pass
     try:
-        send_mailgun_email(
-            mailgun_api_key=settings.MAILGUN_API_KEY,
-            mailgun_domain=settings.MAILGUN_DOMAIN,
-            from_email=f"Clef Rights <console@{settings.MAILGUN_DOMAIN}>",
+        notification_provider.send(
             to_emails=[owner],
             subject=f"Approval requested: {req.key}",
             text=f"Approval requested for {req.key} by {user.email}.\nDue: {due.isoformat()}\n\nOpen: {settings.CONSOLE_BASE_URL}?key={req.key}&view=detail",
@@ -2756,10 +2699,7 @@ def comments_create(
         pass
     if req.mentions:
         try:
-            send_mailgun_email(
-                mailgun_api_key=settings.MAILGUN_API_KEY,
-                mailgun_domain=settings.MAILGUN_DOMAIN,
-                from_email=f"Clef Rights <console@{settings.MAILGUN_DOMAIN}>",
+            notification_provider.send(
                 to_emails=req.mentions,
                 subject=f"Mentioned in Rights Console: {req.key}",
                 text=f"You were mentioned by {user.email} on {req.key}:\n\n{req.body}\n\nOpen: {settings.CONSOLE_BASE_URL}?key={req.key}&view=detail",
@@ -3710,12 +3650,45 @@ ORG_DECISION_ROLES = {"owner", "admin", "rights_manager"}
 ORG_ADMIN_ROLES = {"owner", "admin"}
 
 
+class NodeReadinessCheck(BaseModel):
+    key: str
+    status: str
+    required: bool
+    summary: str
+    remediation: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class NodeReadiness(BaseModel):
+    ready: bool
+    deploymentMode: str
+    checkedAt: str
+    checks: List[NodeReadinessCheck]
+
+
+class OrganizationOnboardingMilestone(BaseModel):
+    key: str
+    status: str
+    summary: str
+    action: Optional[str] = None
+    count: int = 0
+
+
+class OrganizationOnboardingStatus(BaseModel):
+    organizationId: str
+    organizationType: str
+    complete: bool
+    completedCount: int
+    applicableCount: int
+    milestones: List[OrganizationOnboardingMilestone]
+
+
 class OrganizationCreateRequest(BaseModel):
     slug: str
     name: str
     organization_type: str = "rights_holder"
     default_territory: str = "worldwide"
-    controlled_right_types: List[str] = Field(default_factory=lambda: ["composition"])
+    controlled_right_types: Optional[List[str]] = None
     ai_policy_preset: str = "review_each_ai_use"
 
 
@@ -3879,12 +3852,16 @@ class CatalogClientCreateRequest(BaseModel):
     contact_email: Optional[str] = Field(default=None, max_length=320)
 
 
-class CatalogConflictResolutionRequest(BaseModel):
+class CatalogReviewRequest(BaseModel):
+    expected_preview_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class CatalogConflictResolutionRequest(CatalogReviewRequest):
     resolution: str
     note: str = Field(min_length=1, max_length=4000)
 
 
-class CatalogImportCommitRequest(BaseModel):
+class CatalogImportCommitRequest(CatalogReviewRequest):
     confirm_import: bool = False
 
 
@@ -4092,26 +4069,10 @@ def _validate_rights_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _serialize_receipt(row: PermissionReceiptRecord) -> Dict[str, Any]:
-    return {
-        "payload": row.payload,
-        "proof": {
-            "algorithm": "Ed25519",
-            "canonicalization": "CLEF-CANONICAL-JSON-1",
-            "payloadHash": row.payload_hash,
-            "keyId": row.key_id,
-            "publicKey": row.public_key,
-            "signature": row.signature,
-        },
-        "transparency": {
-            "sequence": row.transparency_sequence,
-            "previousEntryHash": row.previous_entry_hash,
-            "payloadHash": row.payload_hash,
-            "entryHash": row.entry_hash,
-        },
-    }
+    return data_privacy.envelope(row)
 
 
-def _evaluate_permission_policy(
+def _evaluate_usage_policy(
     contract: RightsContractRecord,
     *,
     intended_usage: str,
@@ -4191,6 +4152,85 @@ def _evaluate_permission_policy(
         elif required:
             reasons.append(f"safeguard:{safeguard}:accepted")
     return effective, reasons
+
+
+def _evaluate_permission_policy(
+    contract: RightsContractRecord,
+    *,
+    intended_usage: str,
+    context: Dict[str, Any],
+) -> tuple[str, List[str]]:
+    categories = context.get("restrictionCategories")
+    declared = categories is not None
+    if declared and (
+        not isinstance(categories, list)
+        or any(not isinstance(key, str) or key not in RESTRICTION_KEYS for key in categories)
+    ):
+        raise HTTPException(status_code=422, detail="restrictionCategories must list supported content categories")
+    applicable = set(categories or [])
+    if intended_usage == "ads_political":
+        applicable.add("political")
+    # Accept legacy boolean declarations, with a positive declaration taking precedence.
+    for key in RESTRICTION_KEYS:
+        if key in context:
+            if not isinstance(context[key], bool):
+                raise HTTPException(status_code=422, detail=f"{key} must be a boolean")
+            if context[key]:
+                applicable.add(key)
+    declared = declared or all(key in context for key in RESTRICTION_KEYS)
+    restrictions = (contract.effective_matrix or {}).get("restrictions", {})
+    restriction_state = "allowed"
+    restriction_reasons = []
+    for key in sorted(applicable):
+        value = restrictions.get(key, "denied")
+        restriction_reasons.append(f"restriction:{key}:{value}")
+        if value == "denied":
+            restriction_state = "blocked"
+        elif value == "conditional" and restriction_state == "allowed":
+            restriction_state = "requires_approval"
+    if not declared and any(value != "allowed" for value in restrictions.values()):
+        restriction_reasons.append("restrictions:scope_missing")
+        if restriction_state == "allowed":
+            restriction_state = "requires_approval"
+    state, reasons = _evaluate_usage_policy(contract, intended_usage=intended_usage, context=context)
+    severity = {"allowed": 0, "requires_approval": 1, "blocked": 2}
+    return max((state, restriction_state), key=severity.__getitem__), [*reasons, *restriction_reasons]
+
+
+def _territory_codes(value: str) -> set[str]:
+    normalized = value.strip().lower()
+    if normalized in {"worldwide", "world", "global", "*"}:
+        return {"worldwide"}
+    codes = [code.strip().upper() for code in value.split(",")]
+    if not codes or any(not re.fullmatch(r"[A-Z]{2}", code) for code in codes):
+        raise HTTPException(status_code=422, detail="Use two-letter country codes separated by commas, or worldwide")
+    return set(codes)
+
+
+def _checked_permission_policy(
+    claim: AuthorityClaimRecord,
+    contract: RightsContractRecord,
+    *,
+    intended_usage: str,
+    territory: str,
+    context: Dict[str, Any],
+) -> tuple[str, List[str]]:
+    if claim.status != "verified":
+        raise HTTPException(status_code=409, detail="A verified authority claim is required")
+    requested = _territory_codes(territory)
+    authorized = _territory_codes(claim.territory)
+    if "worldwide" not in authorized and not requested.issubset(authorized):
+        raise HTTPException(status_code=409, detail="Requested territory exceeds the verified authority claim")
+    state, reasons = _evaluate_permission_policy(contract, intended_usage=intended_usage, context=context)
+    if state == "blocked":
+        raise HTTPException(status_code=409, detail={
+            "message": "The current published policy blocks this intended usage or scope",
+            "policyEvaluation": reasons,
+        })
+    if state == "allowed" and _policy_requires_exact_attribution(contract, intended_usage=intended_usage):
+        state = "requires_approval"
+        reasons.append("obligation:attribution:exact_terms_required")
+    return state, reasons
 
 
 ATTRIBUTION_PLACEMENTS = {
@@ -4431,6 +4471,13 @@ def _issue_permission_receipt_locked(
     contract: RightsContractRecord,
     decision_actor: Dict[str, Any],
 ) -> PermissionReceiptRecord:
+    state, reasons = _checked_permission_policy(
+        claim, contract, intended_usage=permission.intended_usage,
+        territory=permission.territory, context=permission.context,
+    )
+    if "restrictions:scope_missing" in reasons:
+        raise HTTPException(status_code=409, detail="Declare applicable content categories before approval")
+    permission.context = {**permission.context, "policyEvaluation": {"state": state, "reasons": reasons}}
     existing = (
         db.query(PermissionReceiptRecord)
         .filter(
@@ -4452,7 +4499,9 @@ def _issue_permission_receipt_locked(
     receipt_id = str(uuid.uuid4())
     issued_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     policy_hash = sha256_hex(canonical_json(contract.contract_json))
+    disclosure_plan = data_privacy.plan_disclosure(db, claim.org_id, permission.requester_org_id)
     payload = {
+        "disclosure": disclosure_plan.private_manifest(),
         "schemaVersion": SCHEMA_VERSION,
         "receiptId": receipt_id,
         "node": {"id": settings.NODE_ID, "keyId": receipt_signer.key_id},
@@ -4516,6 +4565,7 @@ def _issue_permission_receipt_locked(
         created_at=datetime.datetime.utcnow(),
     )
     db.add(row)
+    data_privacy.attach_disclosure(db, row=row, plan=disclosure_plan, signer=receipt_signer)
     db.commit()
     db.refresh(row)
     return row
@@ -4594,7 +4644,9 @@ def _issue_permission_lifecycle_receipt_locked(
     receipt_id = str(uuid.uuid4())
     issued_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     event_effective_at = (effective_at or datetime.datetime.utcnow()).replace(microsecond=0).isoformat() + "Z"
+    disclosure_plan = data_privacy.plan_disclosure(db, claim.org_id, permission.requester_org_id)
     payload = {
+        "disclosure": disclosure_plan.private_manifest(),
         "schemaVersion": LIFECYCLE_SCHEMA_VERSION,
         "receiptId": receipt_id,
         "node": {"id": settings.NODE_ID, "keyId": receipt_signer.key_id},
@@ -4656,6 +4708,7 @@ def _issue_permission_lifecycle_receipt_locked(
         created_at=datetime.datetime.utcnow(),
     )
     db.add(row)
+    data_privacy.attach_disclosure(db, row=row, plan=disclosure_plan, signer=receipt_signer)
     db.commit()
     db.refresh(row)
     return row
@@ -4748,7 +4801,70 @@ def node_info():
         "keyId": receipt_signer.key_id,
         "publicKey": receipt_signer.public_key_b64,
         "ephemeralSigningKey": receipt_signer.ephemeral,
+        "federationEnabled": app.state.federation_config.enabled,
     }
+
+
+@app.get("/v1/node/readiness", response_model=NodeReadiness)
+def node_readiness(
+    db: Session = Depends(get_db),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    user = _require_session_user(db, x_session_id)
+    _require_operator(user)
+    revision = database_revision_state(engine, backend_root=Path(__file__).resolve().parent)
+    heartbeat_rows = db.query(ServiceHeartbeatRecord).all()
+    heartbeats = {
+        row.service_name: HeartbeatSnapshot(
+            status=row.status,
+            last_attempt_at=row.last_attempt_at,
+            last_success_at=row.last_success_at,
+            details=row.details or {},
+        )
+        for row in heartbeat_rows
+    }
+    ddex_configured = all(
+        (
+            settings.DDEX_IMPLEMENTATION_LICENSE_CONFIRMED,
+            settings.DDEX_DPID,
+            settings.DDEX_PARTNER_DPID,
+            settings.DDEX_SENDER_NAME,
+            settings.DDEX_PARTNER_NAME,
+            settings.DDEX_PROFILE,
+            settings.DDEX_MWL_XSD_PATH,
+        )
+    )
+    result = evaluate_node_readiness(
+        ReadinessInputs(
+            deployment_mode=settings.NODE_DEPLOYMENT_MODE,
+            database_current=revision.current,
+            expected_database_heads=tuple(sorted(revision.expected_heads)),
+            current_database_heads=tuple(sorted(revision.current_heads)),
+            source_code_url=settings.SOURCE_CODE_URL,
+            source_code_revision=settings.SOURCE_CODE_REVISION,
+            ephemeral_signing_key=receipt_signer.ephemeral,
+            notification_provider=settings.NOTIFICATION_PROVIDER,
+            webhook_delivery_enabled=settings.WEBHOOK_DELIVERY_ENABLED,
+            expiry_worker_interval_seconds=settings.EXPIRY_WORKER_INTERVAL_SECONDS,
+            webhook_worker_interval_seconds=settings.WEBHOOK_WORKER_INTERVAL_SECONDS,
+            worker_heartbeats=heartbeats,
+            demo_mode=settings.DEMO_MODE,
+            mock_integrations=settings.MOCK_INTEGRATIONS,
+            development_identity_headers=settings.ALLOW_DEV_IDENTITY_HEADERS,
+            development_magic_links=settings.ALLOW_DEV_MAGIC_LINKS,
+            mlc_enabled=settings.MLC_ENABLED,
+            mlc_configured=bool(
+                settings.MLC_USERNAME
+                and settings.MLC_PASSWORD
+                and settings.MLC_AUTHORIZED_CAPABILITIES
+            ),
+            ddex_enabled=settings.DDEX_ENABLED,
+            ddex_configured=bool(ddex_configured),
+            musicbrainz_enabled=settings.MUSICBRAINZ_ENABLED,
+            musicbrainz_configured=bool(settings.MUSICBRAINZ_BASE_URL),
+        )
+    )
+    return NodeReadiness.model_validate(result)
 
 
 def _session_organizations(db: Session, user: UserRecord) -> List[Dict[str, Any]]:
@@ -4796,6 +4912,164 @@ def v1_session(
     }
 
 
+@app.get(
+    "/v1/organizations/{org_id}/onboarding-status",
+    response_model=OrganizationOnboardingStatus,
+)
+def organization_onboarding_status(
+    org_id: str,
+    db: Session = Depends(get_db),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    user = _require_session_user(db, x_session_id)
+    _require_membership(
+        db,
+        org_id=org_id,
+        user_id=user.id,
+        allowed_roles=ORG_DECISION_ROLES,
+    )
+    organization = db.query(OrganizationRecord).filter(OrganizationRecord.id == org_id).first()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    organization_type = (organization.profile or {}).get("organizationType", "rights_holder")
+    requester_only = organization_type == "requester"
+
+    catalog_count = db.query(CatalogAssetRecord).filter(CatalogAssetRecord.org_id == org_id).count()
+    policy_count = db.query(RightsContractRecord).filter(RightsContractRecord.owner_org_id == org_id).count()
+    claim_query = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.org_id == org_id)
+    claim_count = claim_query.count()
+    verified_claim_count = claim_query.filter(AuthorityClaimRecord.status == "verified").count()
+    reviewer_count = (
+        db.query(OrganizationMembershipRecord)
+        .filter(
+            OrganizationMembershipRecord.org_id == org_id,
+            OrganizationMembershipRecord.role.in_(ORG_DECISION_ROLES),
+        )
+        .count()
+    )
+    if requester_only:
+        permission_count = (
+            db.query(PermissionRequestRecord)
+            .filter(PermissionRequestRecord.requester_org_id == org_id)
+            .count()
+        )
+    else:
+        permission_count = (
+            db.query(PermissionRequestRecord)
+            .join(
+                AuthorityClaimRecord,
+                AuthorityClaimRecord.id == PermissionRequestRecord.authority_claim_id,
+            )
+            .filter(AuthorityClaimRecord.org_id == org_id)
+            .count()
+        )
+    webhook_count = (
+        db.query(WebhookEndpointRecord)
+        .filter(WebhookEndpointRecord.org_id == org_id, WebhookEndpointRecord.enabled.is_(True))
+        .count()
+    )
+    settlement_query = db.query(SettlementRecord).filter(
+        (SettlementRecord.requester_org_id == org_id)
+        | (SettlementRecord.authority_org_id == org_id)
+    )
+    settlement_count = settlement_query.count()
+    reconciliation_count = (
+        db.query(SettlementReconciliationRecord)
+        .join(SettlementRecord, SettlementRecord.id == SettlementReconciliationRecord.settlement_id)
+        .filter(
+            (SettlementRecord.requester_org_id == org_id)
+            | (SettlementRecord.authority_org_id == org_id)
+        )
+        .count()
+    )
+
+    def milestone(
+        key: str,
+        status: str,
+        summary: str,
+        *,
+        action: Optional[str] = None,
+        count: int = 0,
+    ) -> Dict[str, Any]:
+        return {"key": key, "status": status, "summary": summary, "action": action, "count": count}
+
+    if requester_only:
+        rights_milestones = [
+            milestone("catalog", "not_applicable", "Requester organizations do not administer a controlled catalog."),
+            milestone("policy", "not_applicable", "Requester organizations cannot publish rights policies."),
+            milestone("authority", "not_applicable", "Requester organizations cannot assert authority through onboarding."),
+            milestone("reviewer", "not_applicable", "Rights-decision routing is managed by the authority organization."),
+        ]
+    else:
+        authority_status = "complete" if verified_claim_count else ("in_progress" if claim_count else "pending")
+        authority_summary = (
+            "At least one authority claim has independent evidence verification."
+            if verified_claim_count
+            else (
+                "Authority evidence has been submitted and is awaiting or resolving review."
+                if claim_count
+                else "No authority claim has been submitted; catalog and policy records alone are not authority."
+            )
+        )
+        rights_milestones = [
+            milestone("catalog", "complete" if catalog_count else "pending", "A managed catalog record is present." if catalog_count else "Import or add a catalog record.", action="catalog", count=catalog_count),
+            milestone("policy", "complete" if policy_count else "pending", "A versioned rights policy is present." if policy_count else "Publish a conservative policy for a managed work.", action="policies", count=policy_count),
+            milestone("authority", authority_status, authority_summary, action="authority", count=verified_claim_count or claim_count),
+            milestone("reviewer", "complete" if reviewer_count else "pending", "A decision-capable organization member is configured." if reviewer_count else "Add an owner, administrator, or rights manager for decisions.", action="team", count=reviewer_count),
+        ]
+
+    request_summary = (
+        "At least one permission request has been submitted."
+        if requester_only and permission_count
+        else "Submit a permission request against verified authority."
+        if requester_only
+        else "At least one permission request has reached this organization."
+        if permission_count
+        else "Publish verified authority before inviting a real permission request."
+    )
+    webhook_status = (
+        "not_applicable"
+        if not settings.WEBHOOK_DELIVERY_ENABLED
+        else ("complete" if webhook_count else "pending")
+    )
+    settlement_status = "complete" if reconciliation_count else ("in_progress" if settlement_count else "pending")
+    milestones = rights_milestones + [
+        milestone("requester", "complete" if permission_count else "pending", request_summary, action="request" if requester_only else "permissions", count=permission_count),
+        milestone(
+            "webhook",
+            webhook_status,
+            "Outbound webhook delivery is disabled for this node."
+            if webhook_status == "not_applicable"
+            else "An enabled partner endpoint is configured."
+            if webhook_count
+            else "Configure an endpoint only when a partner is ready to receive signed events.",
+            action="operations" if webhook_status != "not_applicable" else None,
+            count=webhook_count,
+        ),
+        milestone(
+            "settlement",
+            settlement_status,
+            "A settlement has a current reconciliation record."
+            if reconciliation_count
+            else "A provisional settlement exists but has not been reconciled."
+            if settlement_count
+            else "Reconcile payment and beneficiary records after an approved permission is used.",
+            action="permissions",
+            count=reconciliation_count or settlement_count,
+        ),
+    ]
+    applicable = [row for row in milestones if row["status"] != "not_applicable"]
+    completed_count = sum(row["status"] == "complete" for row in applicable)
+    return {
+        "organizationId": org_id,
+        "organizationType": organization_type,
+        "complete": bool(applicable) and completed_count == len(applicable),
+        "completedCount": completed_count,
+        "applicableCount": len(applicable),
+        "milestones": milestones,
+    }
+
+
 @app.get("/v1/organizations")
 def list_organizations(
     db: Session = Depends(get_db),
@@ -4817,6 +5091,7 @@ def _observed_mlc_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "assertionType": "observed",
         "source": "mlc",
+        "sourceScope": mlc_source_scope(),
         "permissionStatus": "unknown",
         "results": results,
     }
@@ -5088,6 +5363,72 @@ def _catalog_latest_asset(db: Session, *, org_id: str, work_key: str) -> Optiona
     )
 
 
+_LOCAL_CATALOG_LOCK = threading.RLock()
+
+
+@contextmanager
+def _catalog_write_lock(db: Session, org_id: str):
+    """All catalog review/commit/assignment writers share one organization lock."""
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        lock_id = int(hashlib.sha256(f"clef:catalog:{org_id}".encode()).hexdigest()[:15], 16)
+        db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})
+        yield
+    else:
+        with _LOCAL_CATALOG_LOCK:
+            yield
+
+
+def _catalog_review_basis(db, org_id, normalized, source):
+    latest = _catalog_latest_asset(db, org_id=org_id, work_key=normalized.get("work_key"))
+    assignment = _catalog_current_assignment(db, latest.id) if latest else None
+    client = db.query(CatalogClientRecord).filter_by(org_id=org_id, external_reference=normalized.get("client_reference")).first() if normalized.get("client_reference") else None
+    return hashlib.sha256(canonical_json({"normalized": normalized,
+        "assignClient": "client_reference" in source, "incomingClientId": client.id if client else None,
+        "latestId": latest.id if latest else None, "assignmentId": assignment.id if assignment else None})).hexdigest()
+
+
+def _catalog_classify_row(db, org_id, source, clients_by_reference, seen):
+    normalized, errors = _catalog_normalize_row(source)
+    reference = normalized.get("client_reference")
+    if reference and reference not in clients_by_reference:
+        errors.append(f"client_reference {reference!r} does not match a managed client")
+    status = "invalid" if errors else "ready"
+    existing_id = None
+    key = normalized.get("work_key")
+    if not errors and key:
+        if key in seen:
+            status = "duplicate_batch" if seen[key] == normalized else "invalid"
+            if status == "invalid":
+                errors.append("this durable identifier appears earlier in the file with different metadata")
+        else:
+            seen[key] = normalized
+            existing = _catalog_latest_asset(db, org_id=org_id, work_key=key)
+            if existing:
+                existing_id = existing.id
+                assignment = _catalog_current_assignment(db, existing.id)
+                incoming = clients_by_reference.get(reference)
+                client_matches = "client_reference" not in source or (assignment.client_id if assignment else None) == (incoming.id if incoming else None)
+                status = "duplicate_existing" if _catalog_asset_matches(existing, normalized) and client_matches else "conflict"
+                if not client_matches:
+                    errors.append("Managed client differs from the current assignment; review the change and explicitly resolve this row")
+    return dict(normalized_json=normalized, errors=errors, status=status, existing_item_id=existing_id,
+                review_basis=_catalog_review_basis(db, org_id, normalized, source))
+
+
+def _catalog_preview_digest(db, batch):
+    if batch.status == "committed" and batch.review_digest:
+        return batch.review_digest
+    rows = db.query(CatalogImportRowRecord).filter_by(batch_id=batch.id).order_by(CatalogImportRowRecord.row_number).all()
+    return hashlib.sha256(canonical_json({"batchId": batch.id, "fileSha256": batch.file_sha256,
+        "rows": [{"id": row.id, "basis": row.review_basis, "status": row.status,
+                  "resolution": row.resolution, "note": row.resolution_note} for row in rows]})).hexdigest()
+
+
+def _catalog_check_preview(db, batch, expected):
+    if _catalog_preview_digest(db, batch) != expected:
+        raise HTTPException(409, "The import preview changed. Reopen it and review the current rows.")
+
+
 def _serialize_catalog_client(row: CatalogClientRecord) -> Dict[str, Any]:
     return {
         "id": row.id,
@@ -5179,6 +5520,7 @@ def _serialize_catalog_batch(db: Session, batch: CatalogImportBatchRecord, *, in
         "organizationId": batch.org_id,
         "filename": batch.filename,
         "fileSha256": batch.file_sha256,
+        "previewDigest": _catalog_preview_digest(db, batch),
         "status": batch.status,
         "summary": summary,
         "rows": [_serialize_catalog_import_row(db, row) for row in rows],
@@ -5328,94 +5670,100 @@ async def preview_catalog_import(
         raise HTTPException(status_code=413, detail="Catalog CSV exceeds the 10 MB limit")
     if not raw_bytes:
         raise HTTPException(status_code=422, detail="Catalog CSV is empty")
-    file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
-    existing_batch = db.query(CatalogImportBatchRecord).filter(CatalogImportBatchRecord.org_id == org_id, CatalogImportBatchRecord.file_sha256 == file_sha256).first()
-    if existing_batch:
-        return _serialize_catalog_batch(db, existing_batch)
-    try:
-        decoded = raw_bytes.decode("utf-8-sig")
-    except UnicodeDecodeError as error:
-        raise HTTPException(status_code=422, detail="Catalog CSV must be UTF-8 encoded") from error
-    reader = csv.DictReader(io.StringIO(decoded))
-    headers = [str(header or "").strip().lower() for header in (reader.fieldnames or [])]
-    if not headers or len(headers) != len(set(headers)):
-        raise HTTPException(status_code=422, detail="Catalog CSV requires a non-empty header with no duplicate columns")
-    unknown = sorted(set(headers) - set(CATALOG_CSV_COLUMNS))
-    missing = sorted({"item_type", "title"} - set(headers))
-    if unknown or missing:
-        raise HTTPException(status_code=422, detail={"message": "Catalog CSV headers are invalid", "missing": missing, "unknown": unknown, "allowed": list(CATALOG_CSV_COLUMNS)})
-    clients = db.query(CatalogClientRecord).filter(CatalogClientRecord.org_id == org_id).all()
-    clients_by_reference = {row.external_reference: row for row in clients}
-    batch = CatalogImportBatchRecord(
-        id=str(uuid.uuid4()),
-        org_id=org_id,
-        filename=Path(file.filename or "catalog.csv").name[:255],
-        file_sha256=file_sha256,
-        status="preview",
-        summary={},
-        created_by_user_id=principal.user.id if principal.user else None,
-        created_by_api_credential_id=principal.credential.id if principal.credential else None,
-        created_at=datetime.datetime.utcnow(),
-    )
-    db.add(batch)
-    seen: Dict[str, Dict[str, Any]] = {}
-    row_count = 0
-    for row_number, raw_row in enumerate(reader, start=2):
-        row_count += 1
-        if row_count > CATALOG_IMPORT_MAX_ROWS:
-            db.rollback()
-            raise HTTPException(status_code=413, detail="Catalog CSV exceeds the 10,000 row limit")
-        if None in raw_row:
-            db.rollback()
-            raise HTTPException(status_code=422, detail=f"CSV row {row_number} has more values than the header")
-        source = {header: _compact_text(raw_row.get(original)) for header, original in zip(headers, reader.fieldnames or [])}
-        normalized, errors = _catalog_normalize_row(source)
-        client_reference = normalized.get("client_reference")
-        if client_reference and client_reference not in clients_by_reference:
-            errors.append(f"client_reference {client_reference!r} does not match a managed client")
-        status = "invalid" if errors else "ready"
-        existing_item_id = None
-        work_key = normalized.get("work_key")
-        if not errors and work_key:
-            if work_key in seen:
-                if seen[work_key] == normalized:
-                    status = "duplicate_batch"
-                else:
-                    status = "invalid"
-                    errors.append("this durable identifier appears earlier in the file with different metadata")
-            else:
-                seen[work_key] = normalized
-                existing_asset = _catalog_latest_asset(db, org_id=org_id, work_key=work_key)
-                if existing_asset:
-                    existing_item_id = existing_asset.id
-                    status = "duplicate_existing" if _catalog_asset_matches(existing_asset, normalized) else "conflict"
-        db.add(CatalogImportRowRecord(
-            id=str(uuid.uuid4()),
-            batch_id=batch.id,
-            row_number=row_number,
-            source_json=source,
-            normalized_json=normalized,
-            status=status,
-            errors=errors,
-            existing_item_id=existing_item_id,
-            created_at=datetime.datetime.utcnow(),
-        ))
-    if row_count == 0:
-        db.rollback()
-        raise HTTPException(status_code=422, detail="Catalog CSV contains no data rows")
-    db.flush()
-    batch.summary = _catalog_batch_summary(db, batch)
-    _record_v1_audit(db, org_id=org_id, principal=principal, action="catalog.import.previewed", resource_type="catalog_import", resource_id=batch.id, details={"filename": batch.filename, "fileSha256": file_sha256, **batch.summary})
-    try:
-        db.commit()
-    except IntegrityError as error:
-        db.rollback()
+    with _catalog_write_lock(db, org_id):
+        file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
         existing_batch = db.query(CatalogImportBatchRecord).filter(CatalogImportBatchRecord.org_id == org_id, CatalogImportBatchRecord.file_sha256 == file_sha256).first()
         if existing_batch:
             return _serialize_catalog_batch(db, existing_batch)
-        raise HTTPException(status_code=409, detail="Catalog import could not be staged") from error
-    db.refresh(batch)
-    return _serialize_catalog_batch(db, batch)
+        try:
+            decoded = raw_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as error:
+            raise HTTPException(status_code=422, detail="Catalog CSV must be UTF-8 encoded") from error
+        reader = csv.DictReader(io.StringIO(decoded))
+        headers = [str(header or "").strip().lower() for header in (reader.fieldnames or [])]
+        if not headers or len(headers) != len(set(headers)):
+            raise HTTPException(status_code=422, detail="Catalog CSV requires a non-empty header with no duplicate columns")
+        unknown = sorted(set(headers) - set(CATALOG_CSV_COLUMNS))
+        missing = sorted({"item_type", "title"} - set(headers))
+        if unknown or missing:
+            raise HTTPException(status_code=422, detail={"message": "Catalog CSV headers are invalid", "missing": missing, "unknown": unknown, "allowed": list(CATALOG_CSV_COLUMNS)})
+        clients = db.query(CatalogClientRecord).filter(CatalogClientRecord.org_id == org_id).all()
+        clients_by_reference = {row.external_reference: row for row in clients}
+        batch = CatalogImportBatchRecord(
+            id=str(uuid.uuid4()),
+            org_id=org_id,
+            filename=Path(file.filename or "catalog.csv").name[:255],
+            file_sha256=file_sha256,
+            status="preview",
+            summary={},
+            created_by_user_id=principal.user.id if principal.user else None,
+            created_by_api_credential_id=principal.credential.id if principal.credential else None,
+            created_at=datetime.datetime.utcnow(),
+        )
+        db.add(batch)
+        seen: Dict[str, Dict[str, Any]] = {}
+        row_count = 0
+        for row_number, raw_row in enumerate(reader, start=2):
+            row_count += 1
+            if row_count > CATALOG_IMPORT_MAX_ROWS:
+                db.rollback()
+                raise HTTPException(status_code=413, detail="Catalog CSV exceeds the 10,000 row limit")
+            if None in raw_row:
+                db.rollback()
+                raise HTTPException(status_code=422, detail=f"CSV row {row_number} has more values than the header")
+            source = {header: _compact_text(raw_row.get(original)) for header, original in zip(headers, reader.fieldnames or [])}
+            classification = _catalog_classify_row(db, org_id, source, clients_by_reference, seen)
+            db.add(CatalogImportRowRecord(
+                id=str(uuid.uuid4()),
+                batch_id=batch.id,
+                row_number=row_number,
+                source_json=source,
+                **classification,
+                created_at=datetime.datetime.utcnow(),
+            ))
+        if row_count == 0:
+            db.rollback()
+            raise HTTPException(status_code=422, detail="Catalog CSV contains no data rows")
+        db.flush()
+        batch.summary = _catalog_batch_summary(db, batch)
+        _record_v1_audit(db, org_id=org_id, principal=principal, action="catalog.import.previewed", resource_type="catalog_import", resource_id=batch.id, details={"filename": batch.filename, "fileSha256": file_sha256, **batch.summary})
+        try:
+            db.commit()
+        except IntegrityError as error:
+            db.rollback()
+            existing_batch = db.query(CatalogImportBatchRecord).filter(CatalogImportBatchRecord.org_id == org_id, CatalogImportBatchRecord.file_sha256 == file_sha256).first()
+            if existing_batch:
+                return _serialize_catalog_batch(db, existing_batch)
+            raise HTTPException(status_code=409, detail="Catalog import could not be staged") from error
+        db.refresh(batch)
+        return _serialize_catalog_batch(db, batch)
+
+
+@app.post("/v1/organizations/{org_id}/catalog/imports/{batch_id}/refresh")
+def refresh_catalog_import(org_id: str, batch_id: str, req: CatalogReviewRequest,
+    db: Session = Depends(get_db), x_session_id: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None)):
+    principal = _require_v1_principal(db, x_session_id=x_session_id, authorization=authorization, required_scope="catalog:write" if authorization else None)
+    _require_principal_organization(db, principal=principal, org_id=org_id, required_scope="catalog:write" if principal.credential else None, allowed_roles=ORG_DECISION_ROLES)
+    with _catalog_write_lock(db, org_id):
+        batch = _require_catalog_batch(db, org_id=org_id, batch_id=batch_id, lock=True)
+        _catalog_check_preview(db, batch, req.expected_preview_digest)
+        if batch.status != "preview":
+            raise HTTPException(409, "A committed import keeps its original review and history")
+        clients = {row.external_reference: row for row in db.query(CatalogClientRecord).filter_by(org_id=org_id).all()}
+        rows = db.query(CatalogImportRowRecord).filter_by(batch_id=batch.id).order_by(CatalogImportRowRecord.row_number).all()
+        seen = {}
+        for row in rows:
+            for field, value in _catalog_classify_row(db, org_id, row.source_json, clients, seen).items():
+                setattr(row, field, value)
+            row.resolution = row.resolution_note = row.resolved_by_user_id = row.resolved_by_api_credential_id = row.resolved_at = None
+        db.flush()
+        batch.summary = _catalog_batch_summary(db, batch)
+        _record_v1_audit(db, org_id=org_id, principal=principal, action="catalog.import.refreshed",
+            resource_type="catalog_import", resource_id=batch.id,
+            details={"previousPreviewDigest": req.expected_preview_digest, "previewDigest": _catalog_preview_digest(db, batch), **batch.summary})
+        db.commit()
+        return _serialize_catalog_batch(db, batch)
 
 
 @app.post("/v1/organizations/{org_id}/catalog/imports/{batch_id}/rows/{row_id}/resolution")
@@ -5430,28 +5778,34 @@ def resolve_catalog_import_conflict(
 ):
     principal = _require_v1_principal(db, x_session_id=x_session_id, authorization=authorization, required_scope="catalog:write" if authorization else None)
     _require_principal_organization(db, principal=principal, org_id=org_id, required_scope="catalog:write" if principal.credential else None, allowed_roles=ORG_DECISION_ROLES)
-    batch = _require_catalog_batch(db, org_id=org_id, batch_id=batch_id, lock=True)
-    if batch.status != "preview":
-        raise HTTPException(status_code=409, detail="Only a preview batch can be resolved")
-    row = db.query(CatalogImportRowRecord).filter(CatalogImportRowRecord.id == row_id, CatalogImportRowRecord.batch_id == batch.id).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Catalog import row not found")
-    if row.status != "conflict" or not row.existing_item_id:
-        raise HTTPException(status_code=409, detail="Only an existing-catalog conflict can be resolved here")
-    resolution = req.resolution.strip().lower()
-    if resolution not in {"skip", "new_version"}:
-        raise HTTPException(status_code=422, detail="Resolution must be skip or new_version")
-    row.resolution = resolution
-    row.resolution_note = _compact_text(req.note)
-    row.status = "resolved_skip" if resolution == "skip" else "resolved_version"
-    row.resolved_by_user_id = principal.user.id if principal.user else None
-    row.resolved_by_api_credential_id = principal.credential.id if principal.credential else None
-    row.resolved_at = datetime.datetime.utcnow()
-    db.flush()
-    batch.summary = _catalog_batch_summary(db, batch)
-    _record_v1_audit(db, org_id=org_id, principal=principal, action=f"catalog.import.conflict.{resolution}", resource_type="catalog_import_row", resource_id=row.id, details={"batchId": batch.id, "rowNumber": row.row_number, "workKey": row.normalized_json.get("work_key"), "note": row.resolution_note})
-    db.commit()
-    return _serialize_catalog_import_row(db, row)
+    with _catalog_write_lock(db, org_id):
+        batch = _require_catalog_batch(db, org_id=org_id, batch_id=batch_id, lock=True)
+        _catalog_check_preview(db, batch, req.expected_preview_digest)
+        if batch.status != "preview":
+            raise HTTPException(status_code=409, detail="Only a preview batch can be resolved")
+        row = db.query(CatalogImportRowRecord).filter(CatalogImportRowRecord.id == row_id, CatalogImportRowRecord.batch_id == batch.id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Catalog import row not found")
+        if row.status != "conflict" or not row.existing_item_id:
+            raise HTTPException(status_code=409, detail="Only an existing-catalog conflict can be resolved here")
+        if not row.review_basis or row.review_basis != _catalog_review_basis(db, org_id, row.normalized_json, row.source_json):
+            raise HTTPException(409, "Catalog or client assignment changed. Refresh preview before resolving this row.")
+        resolution = req.resolution.strip().lower()
+        if resolution not in {"skip", "new_version"}:
+            raise HTTPException(status_code=422, detail="Resolution must be skip or new_version")
+        if not _compact_text(req.note):
+            raise HTTPException(422, "Record a reason for this catalog decision")
+        row.resolution = resolution
+        row.resolution_note = _compact_text(req.note)
+        row.status = "resolved_skip" if resolution == "skip" else "resolved_version"
+        row.resolved_by_user_id = principal.user.id if principal.user else None
+        row.resolved_by_api_credential_id = principal.credential.id if principal.credential else None
+        row.resolved_at = datetime.datetime.utcnow()
+        db.flush()
+        batch.summary = _catalog_batch_summary(db, batch)
+        _record_v1_audit(db, org_id=org_id, principal=principal, action=f"catalog.import.conflict.{resolution}", resource_type="catalog_import_row", resource_id=row.id, details={"batchId": batch.id, "rowNumber": row.row_number, "workKey": row.normalized_json.get("work_key"), "note": row.resolution_note})
+        db.commit()
+        return {**_serialize_catalog_import_row(db, row), "previewDigest": _catalog_preview_digest(db, batch)}
 
 
 @app.post("/v1/organizations/{org_id}/catalog/imports/{batch_id}/commit")
@@ -5465,85 +5819,100 @@ def commit_catalog_import(
 ):
     principal = _require_v1_principal(db, x_session_id=x_session_id, authorization=authorization, required_scope="catalog:write" if authorization else None)
     _require_principal_organization(db, principal=principal, org_id=org_id, required_scope="catalog:write" if principal.credential else None, allowed_roles=ORG_DECISION_ROLES)
-    if not req.confirm_import:
-        raise HTTPException(status_code=422, detail="Explicit import confirmation is required")
-    batch = _require_catalog_batch(db, org_id=org_id, batch_id=batch_id, lock=True)
-    if batch.status == "committed":
-        return _serialize_catalog_batch(db, batch)
-    if batch.status != "preview":
-        raise HTTPException(status_code=409, detail="Catalog import is not in preview state")
-    rows = db.query(CatalogImportRowRecord).filter(CatalogImportRowRecord.batch_id == batch.id).order_by(CatalogImportRowRecord.row_number.asc()).all()
-    blockers = [row for row in rows if row.status in {"invalid", "conflict"}]
-    if blockers:
-        raise HTTPException(status_code=409, detail={"message": "Resolve or correct all invalid and conflicting rows before commit", "rowNumbers": [row.row_number for row in blockers]})
-    clients = db.query(CatalogClientRecord).filter(CatalogClientRecord.org_id == org_id).all()
-    clients_by_reference = {row.external_reference: row for row in clients}
-    imported = 0
-    for row in rows:
-        if row.status not in {"ready", "resolved_version"}:
-            continue
-        normalized = row.normalized_json
-        work_key = normalized["work_key"]
-        latest = _catalog_latest_asset(db, org_id=org_id, work_key=work_key)
-        if row.status == "ready" and latest:
-            db.rollback()
-            raise HTTPException(status_code=409, detail=f"Catalog changed after preview for {work_key}; upload the file again")
-        if row.status == "resolved_version" and (not latest or latest.id != row.existing_item_id):
-            db.rollback()
-            raise HTTPException(status_code=409, detail=f"Catalog version changed after conflict resolution for {work_key}; upload the file again")
-        client_reference = normalized.get("client_reference")
-        client = clients_by_reference.get(client_reference) if client_reference else None
-        if client_reference and not client:
-            db.rollback()
-            raise HTTPException(status_code=409, detail=f"Managed client {client_reference!r} no longer exists")
-        asset = CatalogAssetRecord(
-            id=str(uuid.uuid4()),
-            org_id=org_id,
-            work_key=work_key,
-            version=(latest.version + 1) if latest else 1,
-            item_type=normalized["item_type"],
-            title=normalized["title"],
-            artist=normalized.get("artist"),
-            iswc=normalized.get("iswc"),
-            isrc=normalized.get("isrc"),
-            mlc_song_code=normalized.get("mlc_song_code"),
-            territory=normalized["territory"],
-            source_reference=normalized.get("source_reference"),
-            metadata_json={"assertionType": "catalog_metadata", "authorityStatus": "unverified", "conflictResolutionNote": row.resolution_note},
-            import_batch_id=batch.id,
-            import_row_number=row.row_number,
-            created_by_user_id=principal.user.id if principal.user else None,
-            created_by_api_credential_id=principal.credential.id if principal.credential else None,
-            created_at=datetime.datetime.utcnow(),
-        )
-        db.add(asset)
+    with _catalog_write_lock(db, org_id):
+        if not req.confirm_import:
+            raise HTTPException(status_code=422, detail="Explicit import confirmation is required")
+        batch = _require_catalog_batch(db, org_id=org_id, batch_id=batch_id, lock=True)
+        _catalog_check_preview(db, batch, req.expected_preview_digest)
+        if batch.status == "committed":
+            return _serialize_catalog_batch(db, batch)
+        if batch.status != "preview":
+            raise HTTPException(status_code=409, detail="Catalog import is not in preview state")
+        rows = db.query(CatalogImportRowRecord).filter(CatalogImportRowRecord.batch_id == batch.id).order_by(CatalogImportRowRecord.row_number.asc()).all()
+        blockers = [row for row in rows if row.status in {"invalid", "conflict"}]
+        if blockers:
+            raise HTTPException(status_code=409, detail={"message": "Resolve or correct all invalid and conflicting rows before commit", "rowNumbers": [row.row_number for row in blockers]})
+        clients = db.query(CatalogClientRecord).filter(CatalogClientRecord.org_id == org_id).all()
+        clients_by_reference = {row.external_reference: row for row in clients}
+        # Validate every reviewed row against current state before the first insert.
+        # Duplicate rows in this file must observe the same pre-commit catalog.
+        for row in rows:
+            if row.status == "resolved_skip":
+                continue
+            if not row.review_basis or row.review_basis != _catalog_review_basis(db, org_id, row.normalized_json, row.source_json):
+                raise HTTPException(409, f"Catalog or client assignment changed for row {row.row_number}. Refresh preview and review the changes.")
+        batch.review_digest = req.expected_preview_digest
+        imported = 0
+        for row in rows:
+            if row.status not in {"ready", "resolved_version"}:
+                continue
+            normalized = row.normalized_json
+            work_key = normalized["work_key"]
+            latest = _catalog_latest_asset(db, org_id=org_id, work_key=work_key)
+            if row.status == "ready" and latest:
+                db.rollback()
+                raise HTTPException(status_code=409, detail=f"Catalog changed after preview for {work_key}; refresh the preview and review the changes")
+            if row.status == "resolved_version" and (not latest or latest.id != row.existing_item_id):
+                db.rollback()
+                raise HTTPException(status_code=409, detail=f"Catalog version changed after conflict resolution for {work_key}; refresh the preview and review the changes")
+            client_reference = normalized.get("client_reference")
+            client = clients_by_reference.get(client_reference) if client_reference else None
+            if latest and "client_reference" not in row.source_json:
+                # A missing column leaves the assignment unchanged. An explicit blank
+                # cell is an unassignment and follows the conflict-review path above.
+                current_assignment = _catalog_current_assignment(db, latest.id)
+                client = next((item for item in clients if current_assignment and item.id == current_assignment.client_id), None)
+            if client_reference and not client:
+                db.rollback()
+                raise HTTPException(status_code=409, detail=f"Managed client {client_reference!r} no longer exists")
+            asset = CatalogAssetRecord(
+                id=str(uuid.uuid4()),
+                org_id=org_id,
+                work_key=work_key,
+                version=(latest.version + 1) if latest else 1,
+                item_type=normalized["item_type"],
+                title=normalized["title"],
+                artist=normalized.get("artist"),
+                iswc=normalized.get("iswc"),
+                isrc=normalized.get("isrc"),
+                mlc_song_code=normalized.get("mlc_song_code"),
+                territory=normalized["territory"],
+                source_reference=normalized.get("source_reference"),
+                metadata_json={"assertionType": "catalog_metadata", "authorityStatus": "unverified", "conflictResolutionNote": row.resolution_note},
+                import_batch_id=batch.id,
+                import_row_number=row.row_number,
+                created_by_user_id=principal.user.id if principal.user else None,
+                created_by_api_credential_id=principal.credential.id if principal.credential else None,
+                created_at=datetime.datetime.utcnow(),
+            )
+            db.add(asset)
+            db.flush()
+            db.add(CatalogAssignmentRecord(
+                id=str(uuid.uuid4()),
+                catalog_asset_id=asset.id,
+                client_id=client.id if client else None,
+                reason=f"Catalog import {batch.id}, row {row.row_number}" + (f": {row.resolution_note}" if row.resolution_note else ""),
+                created_by_user_id=principal.user.id if principal.user else None,
+                created_by_api_credential_id=principal.credential.id if principal.credential else None,
+                created_at=datetime.datetime.utcnow(),
+            ))
+            row.imported_item_id = asset.id
+            row.status = "imported"
+            imported += 1
+        batch.status = "committed"
+        batch.committed_by_user_id = principal.user.id if principal.user else None
+        batch.committed_by_api_credential_id = principal.credential.id if principal.credential else None
+        batch.committed_at = datetime.datetime.utcnow()
         db.flush()
-        db.add(CatalogAssignmentRecord(
-            id=str(uuid.uuid4()),
-            catalog_asset_id=asset.id,
-            client_id=client.id if client else None,
-            reason=f"Catalog import {batch.id}, row {row.row_number}" + (f": {row.resolution_note}" if row.resolution_note else ""),
-            created_by_user_id=principal.user.id if principal.user else None,
-            created_by_api_credential_id=principal.credential.id if principal.credential else None,
-            created_at=datetime.datetime.utcnow(),
-        ))
-        row.imported_item_id = asset.id
-        row.status = "imported"
-        imported += 1
-    batch.status = "committed"
-    batch.committed_by_user_id = principal.user.id if principal.user else None
-    batch.committed_by_api_credential_id = principal.credential.id if principal.credential else None
-    batch.committed_at = datetime.datetime.utcnow()
-    db.flush()
-    batch.summary = _catalog_batch_summary(db, batch)
-    _record_v1_audit(db, org_id=org_id, principal=principal, action="catalog.import.committed", resource_type="catalog_import", resource_id=batch.id, details={"filename": batch.filename, "imported": imported, **batch.summary})
-    try:
-        db.commit()
-    except IntegrityError as error:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="Catalog changed during commit; upload the file again") from error
-    db.refresh(batch)
-    return _serialize_catalog_batch(db, batch)
+        batch.summary = _catalog_batch_summary(db, batch)
+        _record_v1_audit(db, org_id=org_id, principal=principal, action="catalog.import.committed", resource_type="catalog_import", resource_id=batch.id, details={"filename": batch.filename, "imported": imported, **batch.summary})
+        try:
+            db.commit()
+        except IntegrityError as error:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="Catalog changed during commit; refresh the preview and review the changes") from error
+        db.refresh(batch)
+        return _serialize_catalog_batch(db, batch)
 
 
 @app.post("/v1/organizations/{org_id}/catalog/assets/{asset_id}/assignment", status_code=201)
@@ -5557,30 +5926,36 @@ def assign_catalog_asset(
 ):
     principal = _require_v1_principal(db, x_session_id=x_session_id, authorization=authorization, required_scope="catalog:write" if authorization else None)
     _require_principal_organization(db, principal=principal, org_id=org_id, required_scope="catalog:write" if principal.credential else None, allowed_roles=ORG_DECISION_ROLES)
-    asset = db.query(CatalogAssetRecord).filter(CatalogAssetRecord.id == asset_id, CatalogAssetRecord.org_id == org_id).first()
-    if not asset:
-        raise HTTPException(status_code=404, detail="Catalog asset not found")
-    client = None
-    if req.client_id:
-        client = db.query(CatalogClientRecord).filter(CatalogClientRecord.id == req.client_id, CatalogClientRecord.org_id == org_id).first()
-        if not client:
-            raise HTTPException(status_code=422, detail="Managed client is not part of this organization")
-    current = _catalog_current_assignment(db, asset.id)
-    if current and current.client_id == (client.id if client else None):
-        raise HTTPException(status_code=409, detail="This is already the current client assignment")
-    assignment = CatalogAssignmentRecord(
-        id=str(uuid.uuid4()),
-        catalog_asset_id=asset.id,
-        client_id=client.id if client else None,
-        reason=_compact_text(req.reason),
-        created_by_user_id=principal.user.id if principal.user else None,
-        created_by_api_credential_id=principal.credential.id if principal.credential else None,
-        created_at=datetime.datetime.utcnow(),
-    )
-    db.add(assignment)
-    _record_v1_audit(db, org_id=org_id, principal=principal, action="catalog.asset.assigned", resource_type="catalog_asset", resource_id=asset.id, details={"workKey": asset.work_key, "clientId": client.id if client else None, "reason": assignment.reason})
-    db.commit()
-    return _serialize_catalog_asset(db, asset)
+    with _catalog_write_lock(db, org_id):
+        asset = db.query(CatalogAssetRecord).filter(CatalogAssetRecord.id == asset_id, CatalogAssetRecord.org_id == org_id).first()
+        if not asset:
+            raise HTTPException(status_code=404, detail="Catalog asset not found")
+        latest = _catalog_latest_asset(db, org_id=org_id, work_key=asset.work_key)
+        if not latest or latest.id != asset.id:
+            raise HTTPException(409, "A newer catalog version exists. Reload the catalog before changing its managed client.")
+        if not _compact_text(req.reason):
+            raise HTTPException(422, "Record a reason for this client assignment")
+        client = None
+        if req.client_id:
+            client = db.query(CatalogClientRecord).filter(CatalogClientRecord.id == req.client_id, CatalogClientRecord.org_id == org_id).first()
+            if not client:
+                raise HTTPException(status_code=422, detail="Managed client is not part of this organization")
+        current = _catalog_current_assignment(db, asset.id)
+        if current and current.client_id == (client.id if client else None):
+            raise HTTPException(status_code=409, detail="This is already the current client assignment")
+        assignment = CatalogAssignmentRecord(
+            id=str(uuid.uuid4()),
+            catalog_asset_id=asset.id,
+            client_id=client.id if client else None,
+            reason=_compact_text(req.reason),
+            created_by_user_id=principal.user.id if principal.user else None,
+            created_by_api_credential_id=principal.credential.id if principal.credential else None,
+            created_at=datetime.datetime.utcnow(),
+        )
+        db.add(assignment)
+        _record_v1_audit(db, org_id=org_id, principal=principal, action="catalog.asset.assigned", resource_type="catalog_asset", resource_id=asset.id, details={"workKey": asset.work_key, "clientId": client.id if client else None, "reason": assignment.reason})
+        db.commit()
+        return _serialize_catalog_asset(db, asset)
 
 
 @app.post("/v1/organizations")
@@ -5596,9 +5971,17 @@ def create_organization(
     organization_type = req.organization_type.strip().lower()
     if organization_type not in ORGANIZATION_TYPES:
         raise HTTPException(status_code=422, detail="Unsupported organization type")
-    controlled_right_types = list(dict.fromkeys(req.controlled_right_types))
+    controlled_right_types = list(
+        dict.fromkeys(
+            req.controlled_right_types
+            if req.controlled_right_types is not None
+            else DEFAULT_CONTROLLED_RIGHTS_BY_ORGANIZATION_TYPE[organization_type]
+        )
+    )
     if any(right not in RIGHT_TYPES for right in controlled_right_types):
         raise HTTPException(status_code=422, detail="Select only supported controlled rights")
+    if organization_type == "requester" and controlled_right_types:
+        raise HTTPException(status_code=422, detail="Requester organizations cannot select controlled rights")
     if organization_type != "requester" and not controlled_right_types:
         raise HTTPException(status_code=422, detail="Select at least one supported controlled right")
     if req.ai_policy_preset not in {"review_each_ai_use", "block_all_ai"}:
@@ -6289,45 +6672,46 @@ def put_rights_policy(
     db: Session = Depends(get_db),
     x_session_id: Optional[str] = Header(default=None),
 ):
-    user = _require_session_user(db, x_session_id)
-    _require_membership(db, org_id=org_id, user_id=user.id, allowed_roles=ORG_DECISION_ROLES)
-    org = db.query(OrganizationRecord).filter(OrganizationRecord.id == org_id).first()
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    if (org.profile or {}).get("organizationType") == "requester":
-        raise HTTPException(status_code=403, detail="Requester organizations cannot publish rights policies")
-    contract = _validate_rights_policy(req.contract)
-    record = save_contract(
-        db,
-        key=work_key,
-        artist=req.artist_name,
-        payload=contract,
-        editor=user.id,
-        source="organization_policy",
-        note=req.note,
-        owner_org_id=org_id,
-        expected_version=req.expected_version,
-        commit=False,
-    )
-    _record_v1_audit(
-        db,
-        org_id=org_id,
-        principal=V1Principal(user=user),
-        action="rights_policy.published",
-        resource_type="rights_contract",
-        resource_id=record.id,
-        details={"workKey": work_key, "version": record.version},
-    )
-    try:
-        db.commit()
-    except StaleDataError as error:
-        db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "Rights policy changed during this save; reload before retrying"},
-        ) from error
-    db.refresh(record)
-    return {"id": record.id, "orgId": org_id, "workKey": work_key, "version": record.version, "contract": record.contract_json}
+    with _authority_write_lock(db):
+        user = _require_session_user(db, x_session_id)
+        _require_membership(db, org_id=org_id, user_id=user.id, allowed_roles=ORG_DECISION_ROLES)
+        org = db.query(OrganizationRecord).filter(OrganizationRecord.id == org_id).first()
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        if (org.profile or {}).get("organizationType") == "requester":
+            raise HTTPException(status_code=403, detail="Requester organizations cannot publish rights policies")
+        contract = _validate_rights_policy(req.contract)
+        record = save_contract(
+            db,
+            key=work_key,
+            artist=req.artist_name,
+            payload=contract,
+            editor=user.id,
+            source="organization_policy",
+            note=req.note,
+            owner_org_id=org_id,
+            expected_version=req.expected_version,
+            commit=False,
+        )
+        _record_v1_audit(
+            db,
+            org_id=org_id,
+            principal=V1Principal(user=user),
+            action="rights_policy.published",
+            resource_type="rights_contract",
+            resource_id=record.id,
+            details={"workKey": work_key, "version": record.version},
+        )
+        try:
+            db.commit()
+        except StaleDataError as error:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "Rights policy changed during this save; reload before retrying"},
+            ) from error
+        db.refresh(record)
+        return {"id": record.id, "orgId": org_id, "workKey": work_key, "version": record.version, "contract": record.contract_json}
 
 
 def _normalize_authority_evidence(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -6410,7 +6794,7 @@ def create_authority_claim(
         rights_contract_id=contract.id,
         work_key=contract.key,
         right_type=req.right_type,
-        territory=req.territory,
+        territory=",".join(sorted(_territory_codes(req.territory))),
         status="self_asserted",
         evidence=normalized_evidence,
         asserted_by_user_id=user.id,
@@ -6501,10 +6885,12 @@ def directory_authority_claims(
 
 
 def _territories_overlap(left: str, right: str) -> bool:
-    global_values = {"worldwide", "world", "global", "*"}
-    left_value = (left or "worldwide").strip().lower()
-    right_value = (right or "worldwide").strip().lower()
-    return left_value in global_values or right_value in global_values or left_value == right_value
+    try:
+        left_codes, right_codes = _territory_codes(left), _territory_codes(right)
+    except HTTPException:
+        # Historic ambiguous territories require review rather than bypassing conflicts.
+        return True
+    return "worldwide" in left_codes or "worldwide" in right_codes or bool(left_codes & right_codes)
 
 
 def _evidence_share(evidence: Dict[str, Any]) -> Optional[Decimal]:
@@ -6606,120 +6992,121 @@ def verify_authority_claim(
     db: Session = Depends(get_db),
     x_session_id: Optional[str] = Header(default=None),
 ):
-    user = _require_session_user(db, x_session_id)
-    _require_operator(user)
-    claim = (
-        db.query(AuthorityClaimRecord)
-        .filter(AuthorityClaimRecord.id == claim_id)
-        .with_for_update()
-        .first()
-    )
-    if not claim:
-        raise HTTPException(status_code=404, detail="Authority claim not found")
-    if claim.status == "disputed":
-        open_conflicts = (
-            db.query(AuthorityConflictRecord)
-            .filter(
-                AuthorityConflictRecord.status == "open",
-                (AuthorityConflictRecord.claim_a_id == claim.id)
-                | (AuthorityConflictRecord.claim_b_id == claim.id),
-            )
-            .all()
-        )
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Resolve the open authority conflict before verification",
-                "conflictIds": [row.id for row in open_conflicts],
-            },
-        )
-    if claim.status != "self_asserted":
-        raise HTTPException(status_code=409, detail=f"Claim cannot be verified from status {claim.status}")
-    existing_claims = (
-        db.query(AuthorityClaimRecord)
-        .filter(
-            AuthorityClaimRecord.id != claim.id,
-            AuthorityClaimRecord.org_id != claim.org_id,
-            AuthorityClaimRecord.work_key == claim.work_key,
-            AuthorityClaimRecord.right_type == claim.right_type,
-            AuthorityClaimRecord.status == "verified",
-        )
-        .with_for_update()
-        .all()
-    )
-    conflicts: List[AuthorityConflictRecord] = []
-    for existing in existing_claims:
-        basis = _authority_conflict_basis(claim, existing)
-        if not basis:
-            continue
-        claim_a, claim_b = sorted((claim, existing), key=lambda item: item.id)
-        conflict = (
-            db.query(AuthorityConflictRecord)
-            .filter(
-                AuthorityConflictRecord.claim_a_id == claim_a.id,
-                AuthorityConflictRecord.claim_b_id == claim_b.id,
-            )
+    with _authority_write_lock(db):
+        user = _require_session_user(db, x_session_id)
+        _require_operator(user)
+        claim = (
+            db.query(AuthorityClaimRecord)
+            .filter(AuthorityClaimRecord.id == claim_id)
+            .with_for_update()
             .first()
         )
-        if not conflict:
-            conflict = AuthorityConflictRecord(
-                claim_a_id=claim_a.id,
-                claim_b_id=claim_b.id,
-                work_key=claim.work_key,
-                right_type=claim.right_type,
-                basis=basis,
-                status="open",
-                claim_a_prior_status=claim_a.status,
-                claim_b_prior_status=claim_b.status,
-                detected_by_user_id=user.id,
-                detected_at=datetime.datetime.utcnow(),
+        if not claim:
+            raise HTTPException(status_code=404, detail="Authority claim not found")
+        if claim.status == "disputed":
+            open_conflicts = (
+                db.query(AuthorityConflictRecord)
+                .filter(
+                    AuthorityConflictRecord.status == "open",
+                    (AuthorityConflictRecord.claim_a_id == claim.id)
+                    | (AuthorityConflictRecord.claim_b_id == claim.id),
+                )
+                .all()
             )
-            db.add(conflict)
-            db.flush()
-        conflicts.append(conflict)
-        existing.status = "disputed"
-    if conflicts:
-        claim.status = "disputed"
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Resolve the open authority conflict before verification",
+                    "conflictIds": [row.id for row in open_conflicts],
+                },
+            )
+        if claim.status != "self_asserted":
+            raise HTTPException(status_code=409, detail=f"Claim cannot be verified from status {claim.status}")
+        existing_claims = (
+            db.query(AuthorityClaimRecord)
+            .filter(
+                AuthorityClaimRecord.id != claim.id,
+                AuthorityClaimRecord.org_id != claim.org_id,
+                AuthorityClaimRecord.work_key == claim.work_key,
+                AuthorityClaimRecord.right_type == claim.right_type,
+                AuthorityClaimRecord.status == "verified",
+            )
+            .with_for_update()
+            .all()
+        )
+        conflicts: List[AuthorityConflictRecord] = []
+        for existing in existing_claims:
+            basis = _authority_conflict_basis(claim, existing)
+            if not basis:
+                continue
+            claim_a, claim_b = sorted((claim, existing), key=lambda item: item.id)
+            conflict = (
+                db.query(AuthorityConflictRecord)
+                .filter(
+                    AuthorityConflictRecord.claim_a_id == claim_a.id,
+                    AuthorityConflictRecord.claim_b_id == claim_b.id,
+                )
+                .first()
+            )
+            if not conflict:
+                conflict = AuthorityConflictRecord(
+                    claim_a_id=claim_a.id,
+                    claim_b_id=claim_b.id,
+                    work_key=claim.work_key,
+                    right_type=claim.right_type,
+                    basis=basis,
+                    status="open",
+                    claim_a_prior_status=claim_a.status,
+                    claim_b_prior_status=claim_b.status,
+                    detected_by_user_id=user.id,
+                    detected_at=datetime.datetime.utcnow(),
+                )
+                db.add(conflict)
+                db.flush()
+            conflicts.append(conflict)
+            existing.status = "disputed"
+        if conflicts:
+            claim.status = "disputed"
+            claim.reviewed_by_user_id = user.id
+            claim.reviewed_at = datetime.datetime.utcnow()
+            claim.evidence = {**(claim.evidence or {}), "verificationNote": req.evidence_note}
+            affected_org_ids = {claim.org_id}
+            affected_org_ids.update(existing.org_id for existing in existing_claims if existing.status == "disputed")
+            for org_id in affected_org_ids:
+                _record_v1_audit(
+                    db,
+                    org_id=org_id,
+                    principal=V1Principal(user=user),
+                    actor_type="node_operator",
+                    action="authority_claim.conflict_detected",
+                    resource_type="authority_claim",
+                    resource_id=claim.id,
+                    details={"conflictIds": [row.id for row in conflicts], "workKey": claim.work_key},
+                )
+            db.commit()
+            return {
+                "id": claim.id,
+                "status": claim.status,
+                "conflicts": [_serialize_authority_conflict(db, row) for row in conflicts],
+            }
+        claim.status = "verified"
         claim.reviewed_by_user_id = user.id
+        claim.verified_by_user_id = user.id
         claim.reviewed_at = datetime.datetime.utcnow()
+        claim.verified_at = datetime.datetime.utcnow()
         claim.evidence = {**(claim.evidence or {}), "verificationNote": req.evidence_note}
-        affected_org_ids = {claim.org_id}
-        affected_org_ids.update(existing.org_id for existing in existing_claims if existing.status == "disputed")
-        for org_id in affected_org_ids:
-            _record_v1_audit(
-                db,
-                org_id=org_id,
-                principal=V1Principal(user=user),
-                actor_type="node_operator",
-                action="authority_claim.conflict_detected",
-                resource_type="authority_claim",
-                resource_id=claim.id,
-                details={"conflictIds": [row.id for row in conflicts], "workKey": claim.work_key},
-            )
+        _record_v1_audit(
+            db,
+            org_id=claim.org_id,
+            principal=V1Principal(user=user),
+            actor_type="node_operator",
+            action="authority_claim.verified",
+            resource_type="authority_claim",
+            resource_id=claim.id,
+            details={"workKey": claim.work_key, "rightType": claim.right_type, "territory": claim.territory},
+        )
         db.commit()
-        return {
-            "id": claim.id,
-            "status": claim.status,
-            "conflicts": [_serialize_authority_conflict(db, row) for row in conflicts],
-        }
-    claim.status = "verified"
-    claim.reviewed_by_user_id = user.id
-    claim.verified_by_user_id = user.id
-    claim.reviewed_at = datetime.datetime.utcnow()
-    claim.verified_at = datetime.datetime.utcnow()
-    claim.evidence = {**(claim.evidence or {}), "verificationNote": req.evidence_note}
-    _record_v1_audit(
-        db,
-        org_id=claim.org_id,
-        principal=V1Principal(user=user),
-        actor_type="node_operator",
-        action="authority_claim.verified",
-        resource_type="authority_claim",
-        resource_id=claim.id,
-        details={"workKey": claim.work_key, "rightType": claim.right_type, "territory": claim.territory},
-    )
-    db.commit()
-    return {"id": claim.id, "status": claim.status, "verifiedAt": claim.verified_at}
+        return {"id": claim.id, "status": claim.status, "verifiedAt": claim.verified_at}
 
 
 @app.post("/v1/authority-claims/{claim_id}/reject")
@@ -6729,29 +7116,30 @@ def reject_authority_claim(
     db: Session = Depends(get_db),
     x_session_id: Optional[str] = Header(default=None),
 ):
-    user = _require_session_user(db, x_session_id)
-    _require_operator(user)
-    claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == claim_id).first()
-    if not claim:
-        raise HTTPException(status_code=404, detail="Authority claim not found")
-    if claim.status != "self_asserted":
-        raise HTTPException(status_code=409, detail=f"Claim cannot be rejected from status {claim.status}")
-    claim.status = "rejected"
-    claim.reviewed_by_user_id = user.id
-    claim.reviewed_at = datetime.datetime.utcnow()
-    claim.evidence = {**(claim.evidence or {}), "verificationNote": req.evidence_note}
-    _record_v1_audit(
-        db,
-        org_id=claim.org_id,
-        principal=V1Principal(user=user),
-        actor_type="node_operator",
-        action="authority_claim.rejected",
-        resource_type="authority_claim",
-        resource_id=claim.id,
-        details={"workKey": claim.work_key, "rightType": claim.right_type},
-    )
-    db.commit()
-    return {"id": claim.id, "status": claim.status, "reviewedAt": claim.reviewed_at}
+    with _authority_write_lock(db):
+        user = _require_session_user(db, x_session_id)
+        _require_operator(user)
+        claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == claim_id).with_for_update().first()
+        if not claim:
+            raise HTTPException(status_code=404, detail="Authority claim not found")
+        if claim.status != "self_asserted":
+            raise HTTPException(status_code=409, detail=f"Claim cannot be rejected from status {claim.status}")
+        claim.status = "rejected"
+        claim.reviewed_by_user_id = user.id
+        claim.reviewed_at = datetime.datetime.utcnow()
+        claim.evidence = {**(claim.evidence or {}), "verificationNote": req.evidence_note}
+        _record_v1_audit(
+            db,
+            org_id=claim.org_id,
+            principal=V1Principal(user=user),
+            actor_type="node_operator",
+            action="authority_claim.rejected",
+            resource_type="authority_claim",
+            resource_id=claim.id,
+            details={"workKey": claim.work_key, "rightType": claim.right_type},
+        )
+        db.commit()
+        return {"id": claim.id, "status": claim.status, "reviewedAt": claim.reviewed_at}
 
 
 @app.get("/v1/operator/authority-claims")
@@ -6835,93 +7223,94 @@ def resolve_authority_conflict(
     db: Session = Depends(get_db),
     x_session_id: Optional[str] = Header(default=None),
 ):
-    user = _require_session_user(db, x_session_id)
-    _require_operator(user)
-    conflict = (
-        db.query(AuthorityConflictRecord)
-        .filter(AuthorityConflictRecord.id == conflict_id)
-        .with_for_update()
-        .first()
-    )
-    if not conflict:
-        raise HTTPException(status_code=404, detail="Authority conflict not found")
-    if conflict.status != "open":
-        raise HTTPException(status_code=409, detail="Authority conflict is already resolved")
-    resolution = req.resolution.strip().lower()
-    if resolution not in {"claim_a", "claim_b", "compatible", "neither"}:
-        raise HTTPException(
-            status_code=422,
-            detail="resolution must be claim_a, claim_b, compatible, or neither",
+    with _authority_write_lock(db):
+        user = _require_session_user(db, x_session_id)
+        _require_operator(user)
+        conflict = (
+            db.query(AuthorityConflictRecord)
+            .filter(AuthorityConflictRecord.id == conflict_id)
+            .with_for_update()
+            .first()
         )
-    claims = {
-        row.id: row
-        for row in db.query(AuthorityClaimRecord)
-        .filter(AuthorityClaimRecord.id.in_({conflict.claim_a_id, conflict.claim_b_id}))
-        .with_for_update()
-        .all()
-    }
-    claim_a = claims.get(conflict.claim_a_id)
-    claim_b = claims.get(conflict.claim_b_id)
-    if not claim_a or not claim_b:
-        raise HTTPException(status_code=409, detail="A conflicting authority claim is unavailable")
+        if not conflict:
+            raise HTTPException(status_code=404, detail="Authority conflict not found")
+        if conflict.status != "open":
+            raise HTTPException(status_code=409, detail="Authority conflict is already resolved")
+        resolution = req.resolution.strip().lower()
+        if resolution not in {"claim_a", "claim_b", "compatible", "neither"}:
+            raise HTTPException(
+                status_code=422,
+                detail="resolution must be claim_a, claim_b, compatible, or neither",
+            )
+        claims = {
+            row.id: row
+            for row in db.query(AuthorityClaimRecord)
+            .filter(AuthorityClaimRecord.id.in_({conflict.claim_a_id, conflict.claim_b_id}))
+            .with_for_update()
+            .all()
+        }
+        claim_a = claims.get(conflict.claim_a_id)
+        claim_b = claims.get(conflict.claim_b_id)
+        if not claim_a or not claim_b:
+            raise HTTPException(status_code=409, detail="A conflicting authority claim is unavailable")
 
-    conflict.status = "resolved"
-    conflict.resolution = resolution
-    conflict.resolution_note = req.note.strip()
-    conflict.resolved_by_user_id = user.id
-    conflict.resolved_at = datetime.datetime.utcnow()
-    db.flush()
+        conflict.status = "resolved"
+        conflict.resolution = resolution
+        conflict.resolution_note = req.note.strip()
+        conflict.resolved_by_user_id = user.id
+        conflict.resolved_at = datetime.datetime.utcnow()
+        db.flush()
 
-    def activate(claim: AuthorityClaimRecord) -> None:
-        if claim.status in {"rejected", "revoked"}:
-            return
-        if _claim_has_other_open_conflicts(
-            db,
-            claim_id=claim.id,
-            excluded_conflict_id=conflict.id,
-        ):
-            claim.status = "disputed"
-            return
-        claim.status = "verified"
-        claim.reviewed_by_user_id = user.id
-        claim.verified_by_user_id = user.id
-        claim.reviewed_at = datetime.datetime.utcnow()
-        claim.verified_at = claim.verified_at or datetime.datetime.utcnow()
+        def activate(claim: AuthorityClaimRecord) -> None:
+            if claim.status in {"rejected", "revoked"}:
+                return
+            if _claim_has_other_open_conflicts(
+                db,
+                claim_id=claim.id,
+                excluded_conflict_id=conflict.id,
+            ):
+                claim.status = "disputed"
+                return
+            claim.status = "verified"
+            claim.reviewed_by_user_id = user.id
+            claim.verified_by_user_id = user.id
+            claim.reviewed_at = datetime.datetime.utcnow()
+            claim.verified_at = claim.verified_at or datetime.datetime.utcnow()
 
-    def deactivate(claim: AuthorityClaimRecord, prior_status: str) -> None:
-        claim.reviewed_by_user_id = user.id
-        claim.reviewed_at = datetime.datetime.utcnow()
-        if prior_status == "verified" or claim.verified_at:
-            claim.status = "revoked"
-            claim.revoked_at = datetime.datetime.utcnow()
+        def deactivate(claim: AuthorityClaimRecord, prior_status: str) -> None:
+            claim.reviewed_by_user_id = user.id
+            claim.reviewed_at = datetime.datetime.utcnow()
+            if prior_status == "verified" or claim.verified_at:
+                claim.status = "revoked"
+                claim.revoked_at = datetime.datetime.utcnow()
+            else:
+                claim.status = "rejected"
+
+        if resolution == "claim_a":
+            activate(claim_a)
+            deactivate(claim_b, conflict.claim_b_prior_status)
+        elif resolution == "claim_b":
+            activate(claim_b)
+            deactivate(claim_a, conflict.claim_a_prior_status)
+        elif resolution == "compatible":
+            activate(claim_a)
+            activate(claim_b)
         else:
-            claim.status = "rejected"
-
-    if resolution == "claim_a":
-        activate(claim_a)
-        deactivate(claim_b, conflict.claim_b_prior_status)
-    elif resolution == "claim_b":
-        activate(claim_b)
-        deactivate(claim_a, conflict.claim_a_prior_status)
-    elif resolution == "compatible":
-        activate(claim_a)
-        activate(claim_b)
-    else:
-        deactivate(claim_a, conflict.claim_a_prior_status)
-        deactivate(claim_b, conflict.claim_b_prior_status)
-    for org_id in {claim_a.org_id, claim_b.org_id}:
-        _record_v1_audit(
-            db,
-            org_id=org_id,
-            principal=V1Principal(user=user),
-            actor_type="node_operator",
-            action="authority_conflict.resolved",
-            resource_type="authority_conflict",
-            resource_id=conflict.id,
-            details={"resolution": resolution, "workKey": conflict.work_key},
-        )
-    db.commit()
-    return _serialize_authority_conflict(db, conflict)
+            deactivate(claim_a, conflict.claim_a_prior_status)
+            deactivate(claim_b, conflict.claim_b_prior_status)
+        for org_id in {claim_a.org_id, claim_b.org_id}:
+            _record_v1_audit(
+                db,
+                org_id=org_id,
+                principal=V1Principal(user=user),
+                actor_type="node_operator",
+                action="authority_conflict.resolved",
+                resource_type="authority_conflict",
+                resource_id=conflict.id,
+                details={"resolution": resolution, "workKey": conflict.work_key},
+            )
+        db.commit()
+        return _serialize_authority_conflict(db, conflict)
 
 
 @app.post("/v1/permission-requests")
@@ -6931,113 +7320,104 @@ def create_permission_request(
     x_session_id: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
-    principal = _require_v1_principal(
-        db,
-        x_session_id=x_session_id,
-        authorization=authorization,
-        required_scope="permissions:request" if authorization else None,
-    )
-    _require_principal_organization(
-        db,
-        principal=principal,
-        org_id=req.requester_org_id,
-        required_scope="permissions:request" if principal.credential else None,
-    )
-    if req.intended_usage not in USAGE_KEYS:
-        raise HTTPException(status_code=422, detail="Unsupported intended usage")
-    claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == req.authority_claim_id).first()
-    if not claim or claim.status != "verified":
-        raise HTTPException(status_code=409, detail="A verified authority claim is required")
-    if not req.term_start or not req.term_end:
-        raise HTTPException(status_code=422, detail="License start and end dates are required")
-    try:
-        term_start = datetime.date.fromisoformat(req.term_start)
-        term_end = datetime.date.fromisoformat(req.term_end)
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail="License dates must use YYYY-MM-DD") from error
-    if term_end < term_start:
-        raise HTTPException(status_code=422, detail="License end date cannot precede the start date")
-    contract = db.query(RightsContractRecord).filter(RightsContractRecord.id == claim.rights_contract_id).first()
-    if not contract:
-        raise HTTPException(status_code=409, detail="Authority policy is unavailable")
-    policy_state, policy_reasons = _evaluate_permission_policy(
-        contract,
-        intended_usage=req.intended_usage,
-        context=req.context,
-    )
-    if policy_state == "allowed" and _policy_requires_exact_attribution(
-        contract,
-        intended_usage=req.intended_usage,
-    ):
-        policy_state = "requires_approval"
-        policy_reasons.append("obligation:attribution:exact_terms_required")
-    if policy_state == "blocked":
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "The published policy blocks this intended usage or scope", "policyEvaluation": policy_reasons},
-        )
-    request_context = deepcopy(req.context)
-    request_context["policyEvaluation"] = {"state": policy_state, "reasons": policy_reasons}
-    permission = PermissionRequestRecord(
-        requester_org_id=req.requester_org_id,
-        authority_claim_id=claim.id,
-        work_key=claim.work_key,
-        intended_usage=req.intended_usage,
-        territory=req.territory,
-        term_start=req.term_start,
-        term_end=req.term_end,
-        context=request_context,
-        provenance=req.provenance,
-        license_obligations=_empty_license_obligations(),
-        status="pending",
-        requested_by_user_id=principal.user.id if principal.user else None,
-        requested_by_api_credential_id=principal.credential.id if principal.credential else None,
-        requested_at=datetime.datetime.utcnow(),
-    )
-    db.add(permission)
-    db.flush()
-    for org_id in {req.requester_org_id, claim.org_id}:
-        _record_v1_audit(
+    with _authority_write_lock(db):
+        principal = _require_v1_principal(
             db,
-            org_id=org_id,
-            principal=principal,
-            action="permission_request.created",
-            resource_type="permission_request",
-            resource_id=permission.id,
-            details={
-                "authorityClaimId": claim.id,
-                "workKey": claim.work_key,
-                "intendedUsage": req.intended_usage,
-                "policyState": policy_state,
-            },
+            x_session_id=x_session_id,
+            authorization=authorization,
+            required_scope="permissions:request" if authorization else None,
         )
-    response: Dict[str, Any] = {"id": permission.id, "status": permission.status, "policyState": policy_state}
-    if policy_state == "allowed":
-        permission.status = "approved"
-        permission.decided_at = datetime.datetime.utcnow()
-        permission.decision_note = "Automatically approved by the published rights policy"
-        for org_id in {permission.requester_org_id, claim.org_id}:
+        _require_principal_organization(
+            db,
+            principal=principal,
+            org_id=req.requester_org_id,
+            required_scope="permissions:request" if principal.credential else None,
+        )
+        if req.intended_usage not in USAGE_KEYS:
+            raise HTTPException(status_code=422, detail="Unsupported intended usage")
+        claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == req.authority_claim_id).with_for_update().first()
+        if not claim or claim.status != "verified":
+            raise HTTPException(status_code=409, detail="A verified authority claim is required")
+        if not req.term_start or not req.term_end:
+            raise HTTPException(status_code=422, detail="License start and end dates are required")
+        try:
+            term_start = datetime.date.fromisoformat(req.term_start)
+            term_end = datetime.date.fromisoformat(req.term_end)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="License dates must use YYYY-MM-DD") from error
+        if term_end < term_start:
+            raise HTTPException(status_code=422, detail="License end date cannot precede the start date")
+        contract = db.query(RightsContractRecord).filter(RightsContractRecord.id == claim.rights_contract_id).with_for_update().first()
+        if not contract:
+            raise HTTPException(status_code=409, detail="Authority policy is unavailable")
+        policy_state, policy_reasons = _checked_permission_policy(
+            claim, contract,
+            intended_usage=req.intended_usage,
+            territory=req.territory,
+            context=req.context,
+        )
+        request_context = deepcopy(req.context)
+        request_context["policyEvaluation"] = {"state": policy_state, "reasons": policy_reasons}
+        permission = PermissionRequestRecord(
+            requester_org_id=req.requester_org_id,
+            authority_claim_id=claim.id,
+            work_key=claim.work_key,
+            intended_usage=req.intended_usage,
+            territory=",".join(sorted(_territory_codes(req.territory))),
+            term_start=req.term_start,
+            term_end=req.term_end,
+            context=request_context,
+            provenance=req.provenance,
+            license_obligations=_empty_license_obligations(),
+            status="pending",
+            requested_by_user_id=principal.user.id if principal.user else None,
+            requested_by_api_credential_id=principal.credential.id if principal.credential else None,
+            requested_at=datetime.datetime.utcnow(),
+        )
+        db.add(permission)
+        db.flush()
+        for org_id in {req.requester_org_id, claim.org_id}:
             _record_v1_audit(
                 db,
                 org_id=org_id,
-                actor_type="policy",
-                action="permission_request.approved",
+                principal=principal,
+                action="permission_request.created",
                 resource_type="permission_request",
                 resource_id=permission.id,
-                details={"contractId": contract.id, "policyVersion": contract.version},
+                details={
+                    "authorityClaimId": claim.id,
+                    "workKey": claim.work_key,
+                    "intendedUsage": req.intended_usage,
+                    "policyState": policy_state,
+                },
             )
-        receipt = _issue_permission_receipt(
-            db,
-            permission=permission,
-            claim=claim,
-            contract=contract,
-            decision_actor={"type": "policy", "contractId": contract.id, "version": contract.version},
-        )
-        response.update({"status": "approved", "receipt": _serialize_receipt(receipt)})
-    else:
-        db.commit()
-        db.refresh(permission)
-    return response
+        response: Dict[str, Any] = {"id": permission.id, "status": permission.status, "policyState": policy_state}
+        if policy_state == "allowed":
+            permission.status = "approved"
+            permission.decided_at = datetime.datetime.utcnow()
+            permission.decision_note = "Automatically approved by the published rights policy"
+            for org_id in {permission.requester_org_id, claim.org_id}:
+                _record_v1_audit(
+                    db,
+                    org_id=org_id,
+                    actor_type="policy",
+                    action="permission_request.approved",
+                    resource_type="permission_request",
+                    resource_id=permission.id,
+                    details={"contractId": contract.id, "policyVersion": contract.version},
+                )
+            receipt = _issue_permission_receipt(
+                db,
+                permission=permission,
+                claim=claim,
+                contract=contract,
+                decision_actor={"type": "policy", "contractId": contract.id, "version": contract.version},
+            )
+            response.update({"status": "approved", "receipt": _serialize_receipt(receipt)})
+        else:
+            db.commit()
+            db.refresh(permission)
+        return response
 
 
 @app.post("/v1/permission-requests/{permission_id}/decide")
@@ -7048,102 +7428,111 @@ def decide_permission_request(
     x_session_id: Optional[str] = Header(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
-    principal = _require_v1_principal(
-        db,
-        x_session_id=x_session_id,
-        authorization=authorization,
-        required_scope="permissions:decide" if authorization else None,
-    )
-    permission = (
-        db.query(PermissionRequestRecord)
-        .filter(PermissionRequestRecord.id == permission_id)
-        .with_for_update()
-        .first()
-    )
-    if not permission:
-        raise HTTPException(status_code=404, detail="Permission request not found")
-    if permission.status != "pending":
-        raise HTTPException(status_code=409, detail=f"Permission request is already {permission.status}")
-    claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == permission.authority_claim_id).first()
-    membership = _require_principal_organization(
-        db,
-        principal=principal,
-        org_id=claim.org_id,
-        required_scope="permissions:decide" if principal.credential else None,
-        allowed_roles=ORG_DECISION_ROLES,
-    )
-    assignment = _require_assigned_reviewer(
-        db,
-        permission_id=permission.id,
-        principal=principal,
-    )
-    decision = req.decision.strip().lower()
-    if decision not in {"approved", "rejected"}:
-        raise HTTPException(status_code=422, detail="decision must be approved or rejected")
-    decision_note = (req.note or "").strip()
-    if not decision_note:
-        raise HTTPException(status_code=422, detail="A manual decision requires a concrete note")
-    if decision == "approved" and (not permission.term_start or not permission.term_end):
-        raise HTTPException(status_code=409, detail="A permission request without a declared license term cannot be approved")
-    contract = (
-        db.query(RightsContractRecord)
-        .filter(RightsContractRecord.id == claim.rights_contract_id)
-        .first()
-    )
-    if not contract:
-        raise HTTPException(status_code=409, detail="Authority policy is unavailable")
-    if decision == "rejected" and req.obligations is not None:
-        raise HTTPException(status_code=422, detail="License obligations apply only to an approval")
-    obligations = (
-        _normalize_license_obligations(
-            req.obligations,
-            attribution_required_by_policy=_policy_requires_exact_attribution(
-                contract,
-                intended_usage=permission.intended_usage,
-            ),
-        )
-        if decision == "approved"
-        else _empty_license_obligations()
-    )
-    permission.status = decision
-    permission.decided_by_user_id = principal.user.id if principal.user else None
-    permission.decided_by_api_credential_id = principal.credential.id if principal.credential else None
-    permission.decision_note = decision_note
-    permission.license_obligations = obligations
-    permission.decided_at = datetime.datetime.utcnow()
-    for org_id in {permission.requester_org_id, claim.org_id}:
-        _record_v1_audit(
+    with _authority_write_lock(db):
+        principal = _require_v1_principal(
             db,
-            org_id=org_id,
+            x_session_id=x_session_id,
+            authorization=authorization,
+            required_scope="permissions:decide" if authorization else None,
+        )
+        permission = (
+            db.query(PermissionRequestRecord)
+            .filter(PermissionRequestRecord.id == permission_id)
+            .with_for_update()
+            .first()
+        )
+        if not permission:
+            raise HTTPException(status_code=404, detail="Permission request not found")
+        if permission.status != "pending":
+            raise HTTPException(status_code=409, detail=f"Permission request is already {permission.status}")
+        claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == permission.authority_claim_id).with_for_update().first()
+        if not claim:
+            raise HTTPException(status_code=409, detail="Authority claim is unavailable")
+        membership = _require_principal_organization(
+            db,
             principal=principal,
-            action=f"permission_request.{decision}",
-            resource_type="permission_request",
-            resource_id=permission.id,
-            details={
-                "workKey": permission.work_key,
-                "notePresent": True,
-                "reviewAssignmentId": assignment.id if assignment else None,
-                "licenseObligationsHash": sha256_hex(canonical_json(obligations)),
-            },
+            org_id=claim.org_id,
+            required_scope="permissions:decide" if principal.credential else None,
+            allowed_roles=ORG_DECISION_ROLES,
         )
-    response: Dict[str, Any] = {"id": permission.id, "status": permission.status}
-    if decision == "approved":
-        receipt = _issue_permission_receipt(
+        assignment = _require_assigned_reviewer(
             db,
-            permission=permission,
-            claim=claim,
-            contract=contract,
-            decision_actor=_principal_actor(
-                principal,
-                organization_id=claim.org_id,
-                organization_role=membership.role if membership else None,
-            ),
+            permission_id=permission.id,
+            principal=principal,
         )
-        response["receipt"] = _serialize_receipt(receipt)
-    else:
-        db.commit()
-        db.refresh(permission)
-    return response
+        decision = req.decision.strip().lower()
+        if decision not in {"approved", "rejected"}:
+            raise HTTPException(status_code=422, detail="decision must be approved or rejected")
+        decision_note = (req.note or "").strip()
+        if not decision_note:
+            raise HTTPException(status_code=422, detail="A manual decision requires a concrete note")
+        if decision == "approved" and (not permission.term_start or not permission.term_end):
+            raise HTTPException(status_code=409, detail="A permission request without a declared license term cannot be approved")
+        contract = (
+            db.query(RightsContractRecord)
+            .filter(RightsContractRecord.id == claim.rights_contract_id)
+            .with_for_update()
+            .first()
+        )
+        if not contract:
+            raise HTTPException(status_code=409, detail="Authority policy is unavailable")
+        if decision == "approved":
+            _checked_permission_policy(
+                claim, contract, intended_usage=permission.intended_usage,
+                territory=permission.territory, context=permission.context,
+            )
+        if decision == "rejected" and req.obligations is not None:
+            raise HTTPException(status_code=422, detail="License obligations apply only to an approval")
+        obligations = (
+            _normalize_license_obligations(
+                req.obligations,
+                attribution_required_by_policy=_policy_requires_exact_attribution(
+                    contract,
+                    intended_usage=permission.intended_usage,
+                ),
+            )
+            if decision == "approved"
+            else _empty_license_obligations()
+        )
+        permission.status = decision
+        permission.decided_by_user_id = principal.user.id if principal.user else None
+        permission.decided_by_api_credential_id = principal.credential.id if principal.credential else None
+        permission.decision_note = decision_note
+        permission.license_obligations = obligations
+        permission.decided_at = datetime.datetime.utcnow()
+        for org_id in {permission.requester_org_id, claim.org_id}:
+            _record_v1_audit(
+                db,
+                org_id=org_id,
+                principal=principal,
+                action=f"permission_request.{decision}",
+                resource_type="permission_request",
+                resource_id=permission.id,
+                details={
+                    "workKey": permission.work_key,
+                    "notePresent": True,
+                    "reviewAssignmentId": assignment.id if assignment else None,
+                    "licenseObligationsHash": sha256_hex(canonical_json(obligations)),
+                },
+            )
+        response: Dict[str, Any] = {"id": permission.id, "status": permission.status}
+        if decision == "approved":
+            receipt = _issue_permission_receipt(
+                db,
+                permission=permission,
+                claim=claim,
+                contract=contract,
+                decision_actor=_principal_actor(
+                    principal,
+                    organization_id=claim.org_id,
+                    organization_role=membership.role if membership else None,
+                ),
+            )
+            response["receipt"] = _serialize_receipt(receipt)
+        else:
+            db.commit()
+            db.refresh(permission)
+        return response
 
 
 def _stored_permission_actor(
@@ -8027,6 +8416,35 @@ def list_organization_permission_requests(
     }
 
 
+def _require_permission_party(
+    db: Session, *, principal: V1Principal,
+    permission: PermissionRequestRecord, claim: Optional[AuthorityClaimRecord],
+) -> str:
+    candidate_org_ids = {permission.requester_org_id}
+    if claim:
+        candidate_org_ids.add(claim.org_id)
+    viewer_org_id = None
+    if principal.credential:
+        if principal.credential.org_id in candidate_org_ids:
+            viewer_org_id = principal.credential.org_id
+    else:
+        for org_id in candidate_org_ids:
+            membership = (
+                db.query(OrganizationMembershipRecord)
+                .filter(
+                    OrganizationMembershipRecord.org_id == org_id,
+                    OrganizationMembershipRecord.user_id == principal.user.id,
+                )
+                .first()
+            )
+            if membership:
+                viewer_org_id = org_id
+                break
+    if not viewer_org_id:
+        raise HTTPException(status_code=403, detail="Permission access requires a party organization")
+    return viewer_org_id
+
+
 @app.get("/v1/permission-requests/{permission_id}")
 def get_permission_request(
     permission_id: str,
@@ -8052,28 +8470,7 @@ def get_permission_request(
         .filter(AuthorityClaimRecord.id == permission.authority_claim_id)
         .first()
     )
-    candidate_org_ids = {permission.requester_org_id}
-    if claim:
-        candidate_org_ids.add(claim.org_id)
-    viewer_org_id = None
-    if principal.credential:
-        if principal.credential.org_id in candidate_org_ids:
-            viewer_org_id = principal.credential.org_id
-    else:
-        for org_id in candidate_org_ids:
-            membership = (
-                db.query(OrganizationMembershipRecord)
-                .filter(
-                    OrganizationMembershipRecord.org_id == org_id,
-                    OrganizationMembershipRecord.user_id == principal.user.id,
-                )
-                .first()
-            )
-            if membership:
-                viewer_org_id = org_id
-                break
-    if not viewer_org_id:
-        raise HTTPException(status_code=403, detail="Permission access requires a party organization")
+    viewer_org_id = _require_permission_party(db, principal=principal, permission=permission, claim=claim)
     return _serialize_permission_for_org(
         db, permission=permission, viewer_org_id=viewer_org_id
     )
@@ -8499,8 +8896,6 @@ def create_settlement(
         required_scope="settlements:write" if authorization else None,
     )
     existing, permission, claim = _settlement_context(db, permission_id=permission_id)
-    if existing:
-        raise HTTPException(status_code=409, detail="This permission already has settlement terms")
     _require_principal_organization(
         db,
         principal=principal,
@@ -8508,6 +8903,8 @@ def create_settlement(
         required_scope="settlements:write" if principal.credential else None,
         allowed_roles=ORG_DECISION_ROLES,
     )
+    if existing:
+        raise HTTPException(status_code=409, detail="This permission already has settlement terms")
     if permission.status not in {"pending", "approved"}:
         raise HTTPException(status_code=409, detail=f"Settlement terms cannot be created for a {permission.status} permission")
     currency = req.currency.strip().upper()
@@ -8668,6 +9065,17 @@ def create_settlement_entry(
     kind = req.kind.strip().lower()
     if kind not in SETTLEMENT_ENTRY_KINDS:
         raise HTTPException(status_code=422, detail="Unsupported settlement entry kind")
+    # A repeated key must pass the same party/role checks as a new operation.
+    # Check before comparing cached data, which itself reveals private evidence.
+    requester_kind = kind in {"reserve", "reserve_release"}
+    actor_org_id = settlement.requester_org_id if requester_kind else settlement.authority_org_id
+    _require_principal_organization(
+        db,
+        principal=principal,
+        org_id=actor_org_id,
+        required_scope="settlements:write" if principal.credential else None,
+        allowed_roles=None if requester_kind else ORG_DECISION_ROLES,
+    )
     idempotency_key = req.idempotency_key.strip()
     if not idempotency_key:
         raise HTTPException(status_code=422, detail="A non-blank idempotency key is required")
@@ -8688,15 +9096,6 @@ def create_settlement_entry(
             raise HTTPException(status_code=409, detail="Idempotency key was already used for different entry data")
         return _serialize_settlement_entry(db, existing)
 
-    requester_kind = kind in {"reserve", "reserve_release"}
-    actor_org_id = settlement.requester_org_id if requester_kind else settlement.authority_org_id
-    _require_principal_organization(
-        db,
-        principal=principal,
-        org_id=actor_org_id,
-        required_scope="settlements:write" if principal.credential else None,
-        allowed_roles=None if requester_kind else ORG_DECISION_ROLES,
-    )
     if kind in {"reserve", "payment_received", "payout", "royalty_adjustment_increase"} and not _has_grant_receipt(db, permission.id):
         if kind != "reserve":
             raise HTTPException(status_code=409, detail="A signed grant receipt is required before recording this entry")
@@ -8929,7 +9328,9 @@ def _build_settlement_reconciliation_receipt(
     authority_org = db.query(OrganizationRecord).filter(OrganizationRecord.id == settlement.authority_org_id).first()
     issued_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     assertion_type = "paid" if totals["balanced"] else "provisional"
+    disclosure_plan = data_privacy.plan_disclosure(db, claim.org_id, permission.requester_org_id)
     payload = {
+        "disclosure": disclosure_plan.private_manifest(),
         "schemaVersion": SETTLEMENT_SCHEMA_VERSION,
         "receiptId": receipt_id,
         "node": {"id": settings.NODE_ID, "keyId": receipt_signer.key_id},
@@ -9006,7 +9407,7 @@ def _build_settlement_reconciliation_receipt(
         transparency_sequence=sequence,
         previous_entry_hash=previous_entry_hash,
     )
-    return PermissionReceiptRecord(
+    receipt_row = PermissionReceiptRecord(
         id=receipt_id,
         permission_request_id=permission.id,
         receipt_kind="settlement_reconciliation",
@@ -9023,6 +9424,10 @@ def _build_settlement_reconciliation_receipt(
         entry_hash=signed["transparency"]["entryHash"],
         created_at=datetime.datetime.utcnow(),
     )
+
+    db.add(receipt_row)
+    data_privacy.attach_disclosure(db, row=receipt_row, plan=disclosure_plan, signer=receipt_signer)
+    return receipt_row
 
 
 @app.post("/v1/settlements/{settlement_id}/reconciliations", status_code=201)
@@ -9666,10 +10071,27 @@ def get_ddex_acknowledgement(
 
 
 @app.get("/v1/receipts/{receipt_id}")
-def get_permission_receipt(receipt_id: str, db: Session = Depends(get_db)):
+def get_permission_receipt(
+    receipt_id: str,
+    response: Response,
+    db: Session = Depends(get_db),
+    x_session_id: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    principal = _require_v1_principal(db, x_session_id=x_session_id, authorization=authorization)
     row = db.query(PermissionReceiptRecord).filter(PermissionReceiptRecord.id == receipt_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Receipt not found")
+    required_scope = "settlements:read" if row.schema_version == SETTLEMENT_SCHEMA_VERSION else "permissions:read"
+    if principal.credential and required_scope not in set(principal.credential.scopes or []):
+        raise HTTPException(status_code=403, detail=f"API credential requires scope {required_scope}")
+    permission = db.query(PermissionRequestRecord).filter(PermissionRequestRecord.id == row.permission_request_id).first()
+    if not permission:
+        raise HTTPException(status_code=404, detail="Receipt permission is unavailable")
+    claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == permission.authority_claim_id).first()
+    _require_permission_party(db, principal=principal, permission=permission, claim=claim)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, X-Session-Id"
     return _serialize_receipt(row)
 
 
@@ -9690,7 +10112,7 @@ def transparency_head(db: Session = Depends(get_db)):
     row = db.query(PermissionReceiptRecord).order_by(PermissionReceiptRecord.transparency_sequence.desc()).first()
     if not row:
         return {"sequence": 0, "entryHash": None}
-    return {"sequence": row.transparency_sequence, "entryHash": row.entry_hash, "receiptId": row.id}
+    return {"sequence": row.transparency_sequence, "entryHash": row.entry_hash}
 
 
 @app.get("/v1/transparency/entries")
@@ -9710,14 +10132,9 @@ def transparency_entries(
         "entries": [
             {
                 "sequence": row.transparency_sequence,
-                "receiptId": row.id,
-                "receiptKind": row.receipt_kind,
-                "permissionRequestId": row.permission_request_id,
-                "priorReceiptId": row.prior_receipt_id,
                 "payloadHash": row.payload_hash,
                 "previousEntryHash": row.previous_entry_hash,
                 "entryHash": row.entry_hash,
-                "createdAt": row.created_at,
             }
             for row in rows
         ]
@@ -9728,3 +10145,45 @@ def transparency_entries(
 @app.get("/")
 async def root():
     return {"service": "Clef Rights Node API", "version": "0.3.0", "docs": "/docs"}
+
+
+def _public_reconciliation_status(db: Session, receipt_id: str) -> Dict[str, Any]:
+    """Expose freshness of this assertion using retained ledger records, without amounts or parties."""
+    reconciliation = db.query(SettlementReconciliationRecord).filter_by(receipt_id=receipt_id).first()
+    settlement = db.get(SettlementRecord, reconciliation.settlement_id) if reconciliation else None
+    if not settlement:
+        return {"reconciliationCurrent": False, "settlementAssertion": "unavailable"}
+    digest = _settlement_ledger_digest(settlement, _settlement_beneficiaries(db, settlement.id),
+                                     _settlement_entries(db, settlement.id))
+    current = reconciliation.ledger_digest == digest
+    assertion = reconciliation.assertion_type if current else "provisional"
+    return {"reconciliationCurrent": current,
+            "settlementAssertion": assertion if assertion in {"paid", "provisional"} else "unavailable"}
+
+
+from privacy_routes import register_privacy_routes
+from sandbox_tour import register_sandbox_tour
+from federation_routes import register_federation_routes
+from authority_withdrawal import register_authority_withdrawal
+register_authority_withdrawal(
+    app, get_db=get_db, require_user=_require_session_user, require_membership=_require_membership,
+    audit=_record_v1_audit, write_lock=_authority_write_lock,
+)
+register_federation_routes(
+    app, settings=settings, signer=receipt_signer, get_db=get_db, require_user=_require_session_user,
+    require_membership=_require_membership, require_principal=_require_v1_principal,
+    audit=_record_v1_audit, write_lock=_transparency_write_lock, default_ai_policy=default_ai_policy,
+    vocabulary={"usage": USAGE_KEYS, "restrictions": RESTRICTION_KEYS, "inputs": AI_INPUT_KEYS,
+                "modelScopes": AI_MODEL_SCOPE_KEYS, "limits": AI_LIMIT_KEYS, "safeguards": AI_SAFEGUARD_KEYS},
+)
+register_sandbox_tour(
+    app, settings=settings, get_db=get_db, require_user=_require_session_user,
+    default_ai_policy=default_ai_policy, usage_keys=USAGE_KEYS,
+    restriction_keys=RESTRICTION_KEYS, safeguard_keys=AI_SAFEGUARD_KEYS,
+)
+register_privacy_routes(
+    app, get_db=get_db, require_user=_require_session_user, require_membership=_require_membership,
+    require_principal=_require_v1_principal, require_party=_require_permission_party,
+    audit=_record_v1_audit, write_lock=_transparency_write_lock, signer=receipt_signer,
+    settlement_status=_public_reconciliation_status,
+)

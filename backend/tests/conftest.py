@@ -30,6 +30,8 @@ os.environ.update(
         "WEBHOOK_ALLOW_PRIVATE_TARGETS": "false",
         "MAILGUN_API_KEY": "",
         "MLC_ENABLED": "false",
+        "FEDERATION_ENABLED": "false",
+        "FEDERATION_PEERS_JSON": "[]",
         "MLC_USERNAME": "",
         "MLC_PASSWORD": "",
         "MLC_AUTHORIZED_CAPABILITIES": "",

@@ -64,13 +64,15 @@ def valid_bundle(manifest: dict, publication_url: str) -> dict:
     permission = {
         "id": "permission-1",
         "requester": {"organizationId": "requester-org"},
-        "authority": {"organizationId": "authority-org"},
+        "authority": {"organizationId": "authority-org", "claimId": "claim-1"},
         "workKey": manifest["workKey"],
         "intendedUsage": manifest["intendedUsage"],
         "territory": "US",
         "termStart": (today - datetime.timedelta(days=1)).isoformat(),
         "termEnd": (today + datetime.timedelta(days=365)).isoformat(),
         "status": "approved",
+        "context": {"requestPurpose": "Synthetic pilot fixture"},
+        "requestedBy": {"type": "organization_member", "userId": "requester-user", "organizationId": "requester-org"},
         "provenance": {"sourceArtifact": "sha256:source-audio"},
         "licenseObligations": obligations,
         "reviewAssignment": {
@@ -104,9 +106,13 @@ def valid_bundle(manifest: dict, publication_url: str) -> dict:
     }
     receipt_payload = {
         "receiptId": "grant-receipt",
+        "status": "permissioned",
+        "requester": {"organizationId": "requester-org"},
+        "provenance": dict(permission["provenance"]),
         "node": {"id": "urn:clef:rights-node:pilot", "keyId": "ed25519:pilot"},
         "permission": {
             "requestId": "permission-1",
+            **{key: permission[key] for key in ("workKey", "intendedUsage", "territory", "termStart", "termEnd", "context")},
             "licenseObligations": obligations,
             "requestedBy": {
                 "type": "organization_member",
@@ -115,6 +121,7 @@ def valid_bundle(manifest: dict, publication_url: str) -> dict:
             },
         },
         "authority": {
+            "claimId": "claim-1",
             "organizationId": "authority-org",
             "rightType": "composition",
             "territory": "US",
@@ -125,7 +132,7 @@ def valid_bundle(manifest: dict, publication_url: str) -> dict:
                 "documentSha256": manifest["authorityEvidence"]["documentSha256"],
             },
         },
-        "decision": {"actor": reviewer},
+        "decision": {"actor": dict(reviewer), "result": "approved"},
     }
     settlement = {
         "id": "settlement-1",
@@ -138,26 +145,48 @@ def valid_bundle(manifest: dict, publication_url: str) -> dict:
         "totals": {
             "balanced": True,
             "obligationMinor": 15000,
+            "paymentReceivedMinor": 15000,
+            "payoutMinor": 15000,
             "paymentVarianceMinor": 0,
             "payoutVarianceMinor": 0,
+            "beneficiaries": [
+                {
+                    "beneficiaryId": "beneficiary-artist",
+                    "obligationMinor": 10500,
+                    "payoutMinor": 10500,
+                    "varianceMinor": 0,
+                },
+                {
+                    "beneficiaryId": "beneficiary-publisher",
+                    "obligationMinor": 4500,
+                    "payoutMinor": 4500,
+                    "varianceMinor": 0,
+                },
+            ],
         },
         "beneficiaries": [
-            {"identifier": "artist", "shareBps": 7000},
-            {"identifier": "publisher", "shareBps": 3000},
+            {"id": "beneficiary-artist", "identifier": "artist", "shareBps": 7000},
+            {"id": "beneficiary-publisher", "identifier": "publisher", "shareBps": 3000},
         ],
         "entries": [
             {
                 "kind": "payment_received",
+                "amountMinor": 15000,
+                "beneficiaryId": None,
                 "externalReference": "bank-payment-001",
                 "evidence": {"statementSha256": "payment-evidence"},
             },
             {
                 "kind": "payout",
+                "amountMinor": 10500,
+                "beneficiaryId": "beneficiary-artist",
                 "externalReference": "artist-payout-001",
                 "evidence": {"statementSha256": "artist-payout-evidence"},
             },
             {
                 "kind": "payout",
+                "amountMinor": 4500,
+                "beneficiaryId": "beneficiary-publisher",
                 "externalReference": "publisher-payout-001",
                 "evidence": {"statementSha256": "publisher-payout-evidence"},
             },
@@ -166,19 +195,24 @@ def valid_bundle(manifest: dict, publication_url: str) -> dict:
             {
                 "id": "reconciliation-1",
                 "assertionType": "paid",
+                "entryCount": 3,
                 "ledgerDigest": "ledger-digest",
                 "receiptId": "settlement-receipt",
+                "totals": None,
             }
         ],
     }
+    settlement["reconciliations"][0]["totals"] = settlement["totals"]
     return {
         "node": {
             "nodeId": "urn:clef:rights-node:pilot",
             "keyId": "ed25519:pilot",
             "ephemeralSigningKey": False,
             "softwareLicense": "AGPL-3.0-only",
-            "sourceCodeUrl": "https://source.invalid/releases/pilot",
-            "sourceCodeRevision": "pilot-release-1",
+            "sourceCodeUrl": "https://github.com/tymrtn/clef-rights-node/tree/0123456789abcdef0123456789abcdef01234567",
+            "sourceCodeRevision": "0123456789abcdef0123456789abcdef01234567",
+            "sourceHttpStatus": 200,
+            "sourceVerification": {"verified": True, "revision": "0123456789abcdef0123456789abcdef01234567"},
         },
         "capabilities": {
             "mlc": [
@@ -223,7 +257,18 @@ def valid_bundle(manifest: dict, publication_url: str) -> dict:
             "transparencyHashValid": True,
         },
         "settlement": settlement,
-        "reconciliationReceipt": {"payload": {"receiptId": "settlement-receipt"}},
+        "reconciliationReceipt": {
+            "payload": {
+                "receiptId": "settlement-receipt",
+                "settlement": {
+                    "id": "settlement-1",
+                    "reconciliationId": "reconciliation-1",
+                    "ledgerDigest": "ledger-digest",
+                    "entryCount": 3,
+                    "totals": settlement["totals"],
+                },
+            }
+        },
         "reconciliationVerification": {"valid": True, "signatureValid": True},
     }
 
@@ -236,6 +281,40 @@ def test_real_pilot_acceptance_requires_every_live_evidence_chain():
     assert report["qualified"] is True
     assert report["summary"] == {"passed": 12, "failed": 0, "total": 12}
     assert report["manifestSha256"] == pilot.sha256_json(pilot.sanitized_manifest(manifest))
+
+
+@pytest.mark.parametrize("path,value", [
+    (("permission", "requestId"), "another-permission"),
+    (("permission", "workKey"), "iswc:T0000000000"),
+    (("permission", "intendedUsage"), "ai_training"),
+    (("permission", "territory"), "CA"),
+    (("permission", "termStart"), "2000-01-01"),
+    (("permission", "termEnd"), "2099-01-01"),
+    (("permission", "context"), {"requestPurpose": "Another use"}),
+    (("permission", "requestedBy", "userId"), "another-requester"),
+    (("permission", "requestedBy", "organizationId"), "another-requester-org"),
+    (("requester", "organizationId"), "another-requester-org"),
+    (("authority", "claimId"), "another-claim"),
+    (("decision", "actor", "userId"), "another-reviewer"),
+    (("decision", "actor", "organizationId"), "another-authority-org"),
+    (("decision", "result"), "rejected"),
+    (("status",), "revoked"),
+    (("provenance",), {"sourceArtifact": "another-source"}),
+])
+def test_valid_signature_cannot_qualify_a_grant_for_a_different_transaction(path, value):
+    url = "https://platform.invalid/watch/pilot"
+    manifest = pilot.validate_manifest(valid_manifest(hashlib.sha256(b"agreement").hexdigest(), url))
+    bundle = valid_bundle(manifest, url)
+    target = bundle["receipt"]["payload"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    # Model a genuinely signed but incorrectly associated receipt: signature
+    # validity alone must not establish that this is the pilot's transaction.
+    assert bundle["receiptVerification"]["valid"] is True
+    report = pilot.evaluate_pilot(manifest, bundle)
+    assert report["qualified"] is False
+    assert "signed_authority_receipt" in {failure["check"] for failure in report["failures"]}
 
 
 def test_synthetic_run_can_test_rules_but_never_qualifies():
@@ -261,6 +340,75 @@ def test_evidence_fingerprint_mismatch_fails_closed():
     report = pilot.evaluate_pilot(manifest, bundle)
     assert report["qualified"] is False
     assert {failure["check"] for failure in report["failures"]} == {"signed_authority_receipt"}
+
+
+def test_required_backlink_and_metadata_checks_cannot_be_omitted():
+    digest = hashlib.sha256(b"agreement").hexdigest()
+    publication_url = "https://platform.invalid/watch/real"
+    manifest = pilot.validate_manifest(valid_manifest(digest, publication_url))
+
+    missing_backlink = valid_bundle(manifest, publication_url)
+    missing_backlink["permission"]["usageReports"][0]["automatedChecks"].pop("backlinkExactMatch")
+    report = pilot.evaluate_pilot(manifest, missing_backlink)
+    assert {failure["check"] for failure in report["failures"]} == {"publication_and_compliance_evidence"}
+
+    missing_metadata = valid_bundle(manifest, publication_url)
+    missing_metadata["permission"]["usageReports"][0]["automatedChecks"]["metadataExactMatches"] = {}
+    report = pilot.evaluate_pilot(manifest, missing_metadata)
+    assert {failure["check"] for failure in report["failures"]} == {"publication_and_compliance_evidence"}
+
+
+def test_settlement_requires_evidenced_payment_and_exact_beneficiary_payouts():
+    digest = hashlib.sha256(b"agreement").hexdigest()
+    publication_url = "https://platform.invalid/watch/real"
+    manifest = pilot.validate_manifest(valid_manifest(digest, publication_url))
+
+    missing_payouts = valid_bundle(manifest, publication_url)
+    missing_payouts["settlement"]["entries"] = missing_payouts["settlement"]["entries"][:1]
+    report = pilot.evaluate_pilot(manifest, missing_payouts)
+    assert "reconciled_external_payment" in {failure["check"] for failure in report["failures"]}
+
+    missing_payment_evidence = valid_bundle(manifest, publication_url)
+    missing_payment_evidence["settlement"]["entries"][0]["evidence"] = {}
+    report = pilot.evaluate_pilot(manifest, missing_payment_evidence)
+    assert "reconciled_external_payment" in {failure["check"] for failure in report["failures"]}
+
+    incomplete_beneficiary = valid_bundle(manifest, publication_url)
+    incomplete_beneficiary["settlement"]["entries"][2]["beneficiaryId"] = "beneficiary-artist"
+    report = pilot.evaluate_pilot(manifest, incomplete_beneficiary)
+    assert "reconciled_external_payment" in {failure["check"] for failure in report["failures"]}
+
+
+def test_reconciliation_receipt_must_bind_settlement_and_ledger():
+    digest = hashlib.sha256(b"agreement").hexdigest()
+    publication_url = "https://platform.invalid/watch/real"
+    manifest = pilot.validate_manifest(valid_manifest(digest, publication_url))
+    bundle = valid_bundle(manifest, publication_url)
+    bundle["reconciliationReceipt"]["payload"]["settlement"]["ledgerDigest"] = "different-ledger"
+    report = pilot.evaluate_pilot(manifest, bundle)
+    assert "signed_settlement_reconciliation" in {failure["check"] for failure in report["failures"]}
+
+
+def test_production_source_requires_exact_revision_and_reachability():
+    digest = hashlib.sha256(b"agreement").hexdigest()
+    publication_url = "https://platform.invalid/watch/real"
+    manifest = pilot.validate_manifest(valid_manifest(digest, publication_url))
+
+    substring = valid_bundle(manifest, publication_url)
+    substring["node"]["sourceCodeUrl"] += "0-not-the-release"
+    report = pilot.evaluate_pilot(manifest, substring)
+    assert "corresponding_source" in {failure["check"] for failure in report["failures"]}
+
+    unreachable = valid_bundle(manifest, publication_url)
+    unreachable["node"]["sourceHttpStatus"] = None
+    report = pilot.evaluate_pilot(manifest, unreachable)
+    assert "corresponding_source" in {failure["check"] for failure in report["failures"]}
+
+    for proof in (None, {"verified": False}, {"verified": True, "revision": "a" * 40}):
+        unrelated = valid_bundle(manifest, publication_url)
+        unrelated["node"]["sourceVerification"] = proof
+        report = pilot.evaluate_pilot(manifest, unrelated)
+        assert "corresponding_source" in {failure["check"] for failure in report["failures"]}
 
 
 def test_manifest_hashes_private_evidence_file_and_rejects_unknown_fields(tmp_path):

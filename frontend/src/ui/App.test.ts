@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { readStoredEmail } from "./App";
+import {
+  deepLinkOwnerMatchesSession,
+  normaliseKey,
+  readStoredEmail,
+  shouldSearchSongCode,
+} from "./App";
 import { checkedJson } from "../utils/http";
 
 const values = new Map<string, string>();
@@ -38,5 +43,33 @@ describe("checked API responses", () => {
       headers: { "Content-Type": "application/json" },
     });
     await expect(checkedJson(response, "Search")).rejects.toThrow("Search failed (503): registry unavailable");
+  });
+});
+
+describe("external catalog identity", () => {
+  it("keeps a work and its recordings in separate namespaces", () => {
+    const shared = { mlcSongCode: "MLC-1", title: "Home" };
+    expect(normaliseKey(shared, "work")).toBe("mlc:MLC-1");
+    expect(normaliseKey({ ...shared, isrc: "USAAA2600001" }, "recording")).toBe(
+      "isrc:USAAA2600001"
+    );
+    expect(normaliseKey({ ...shared, isrc: "USAAA2600002" }, "recording")).toBe(
+      "isrc:USAAA2600002"
+    );
+  });
+
+  it("does not make an empty song-code request for artist-only search", () => {
+    expect(shouldSearchSongCode({})).toBe(false);
+    expect(shouldSearchSongCode({ title: "Home" })).toBe(true);
+    expect(shouldSearchSongCode({ publisher: "Example Music" })).toBe(true);
+  });
+});
+
+describe("owner-scoped deep links", () => {
+  it("waits for the referenced organization instead of discarding the link", () => {
+    expect(deepLinkOwnerMatchesSession("rights@example.com", null)).toBe(false);
+    expect(deepLinkOwnerMatchesSession("rights@example.com", "other@example.com")).toBe(false);
+    expect(deepLinkOwnerMatchesSession("rights@example.com", "rights@example.com")).toBe(true);
+    expect(deepLinkOwnerMatchesSession(undefined, null)).toBe(true);
   });
 });

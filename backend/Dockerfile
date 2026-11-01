@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+# Python 3.11.15 / Alpine 3.24.2, reviewed 2026-09-18.
+FROM python:3.11-alpine@sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
   PYTHONUNBUFFERED=1 \
@@ -6,17 +7,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps for psycopg2
-RUN apt-get update && apt-get install -y --no-install-recommends \
-  build-essential \
-  libpq-dev \
-  && rm -rf /var/lib/apt/lists/*
+# Dependencies use binary wheels, including psycopg2-binary. Keep available
+# system patches while leaving compilers and PostgreSQL headers out of runtime.
+RUN apk upgrade --no-cache
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt requirements.lock /app/
+RUN pip install --no-cache-dir --only-binary=:all: --require-hashes -r /app/requirements.lock \
+  && pip check \
+  && pip uninstall --yes pip
 
 COPY . /app
 
 EXPOSE 9247
 
-CMD ["bash", "-c", "alembic upgrade head && uvicorn main:app --host '' --port ${PORT:-9247}"]
+CMD ["sh", "-c", "alembic upgrade head && uvicorn main:app --host '' --port ${PORT:-9247}"]

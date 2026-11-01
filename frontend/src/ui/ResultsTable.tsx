@@ -62,14 +62,14 @@ export function ResultsTable({
       },
       publisher: {
         title: "Configure your catalog rights",
-        description: "Import works from MLC or MusicBrainz, then configure AI training permissions, licensing terms, and usage restrictions.",
+        description: "Import works from The MLC or MusicBrainz, then configure AI training permissions, licensing terms, and usage restrictions.",
         steps: [
           "Import works from external registries or load sample data",
           "Configure usage permissions (streaming, sync, AI training)",
           "Set pricing and approval workflows",
         ],
         primaryAction: "Load sample catalog",
-        secondaryAction: "Import from MLC",
+        secondaryAction: "Import from The MLC",
       },
       artist: {
         title: "View your registered works",
@@ -170,7 +170,7 @@ export function ResultsTable({
               </th>
             )}
             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-              MLC Song Code
+              The MLC Song Code
             </th>
             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
               ISRC

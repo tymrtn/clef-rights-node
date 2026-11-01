@@ -51,7 +51,7 @@ export function IntegrationStatus() {
   }
 
   const items = [
-    { name: "MLC", state: data.integrations?.mlc },
+    { name: "The MLC", state: data.integrations?.mlc },
     { name: "MusicBrainz", state: data.integrations?.musicbrainz },
     { name: "Intent", state: data.integrations?.openrouter },
   ].filter((i) => i.state);

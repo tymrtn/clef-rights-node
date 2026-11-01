@@ -71,6 +71,16 @@ class ReceiptSigner:
         self.public_key_b64 = _b64url_encode(public_raw)
         self.key_id = f"ed25519:{sha256_hex(public_raw)[:24]}"
 
+    def sign_statement(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Sign a typed statement; only sign_receipt adds a ledger commitment."""
+        payload_bytes = canonical_json(payload)
+        return {"payload": payload, "proof": {
+            "algorithm": "Ed25519", "canonicalization": CANONICALIZATION,
+            "payloadHash": sha256_hex(payload_bytes), "keyId": self.key_id,
+            "publicKey": self.public_key_b64,
+            "signature": _b64url_encode(self._private_key.sign(payload_bytes)),
+        }}
+
     def sign_receipt(
         self,
         *,
@@ -78,9 +88,8 @@ class ReceiptSigner:
         transparency_sequence: int,
         previous_entry_hash: str | None,
     ) -> dict[str, Any]:
-        payload_bytes = canonical_json(payload)
-        payload_hash = sha256_hex(payload_bytes)
-        signature = self._private_key.sign(payload_bytes)
+        statement = self.sign_statement(payload)
+        payload_hash = statement["proof"]["payloadHash"]
         transparency = {
             "sequence": transparency_sequence,
             "previousEntryHash": previous_entry_hash,
@@ -88,15 +97,7 @@ class ReceiptSigner:
         }
         entry_hash = sha256_hex(canonical_json(transparency))
         return {
-            "payload": payload,
-            "proof": {
-                "algorithm": "Ed25519",
-                "canonicalization": CANONICALIZATION,
-                "payloadHash": payload_hash,
-                "keyId": self.key_id,
-                "publicKey": self.public_key_b64,
-                "signature": _b64url_encode(signature),
-            },
+            **statement,
             "transparency": {
                 **transparency,
                 "entryHash": entry_hash,
@@ -109,6 +110,8 @@ class ReceiptSigner:
             payload = receipt["payload"]
             proof = receipt["proof"]
             transparency = receipt["transparency"]
+            if proof["algorithm"] != "Ed25519" or proof["canonicalization"] != CANONICALIZATION:
+                raise ValueError("Unsupported receipt proof format")
             payload_bytes = canonical_json(payload)
             payload_hash_valid = sha256_hex(payload_bytes) == proof["payloadHash"]
 
@@ -117,7 +120,10 @@ class ReceiptSigner:
                 "previousEntryHash": transparency.get("previousEntryHash"),
                 "payloadHash": proof["payloadHash"],
             }
-            transparency_hash_valid = sha256_hex(canonical_json(transparency_core)) == transparency["entryHash"]
+            transparency_hash_valid = (
+                transparency["payloadHash"] == proof["payloadHash"]
+                and sha256_hex(canonical_json(transparency_core)) == transparency["entryHash"]
+            )
 
             signature_valid = False
             if payload_hash_valid:

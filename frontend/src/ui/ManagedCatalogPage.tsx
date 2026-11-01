@@ -40,6 +40,10 @@ export function ManagedCatalogPage({ onResults, headers }: Props) {
       didAutoRun.current = true;
       run();
     }
+    return () => {
+      requestIdRef.current += 1;
+      didAutoRun.current = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

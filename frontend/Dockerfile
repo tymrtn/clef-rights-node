@@ -12,7 +12,9 @@ ENV VITE_API_BASE=$VITE_API_BASE
 ENV VITE_DEMO_MODE=$VITE_DEMO_MODE
 RUN npm run build
 
-FROM nginx:1.27-alpine
+# Stable release reviewed 2026-09-18: https://nginx.org/en/CHANGES-1.30
+# Pin the multi-platform manifest; review vendor advisories when updating it.
+FROM nginx:1.30.5-alpine@sha256:a5f2157a0302eb0c5e300415effb63a9e70ed1eb9c107283819bf6d149ab607c
 COPY --from=build /app/dist /usr/share/nginx/html
 
 ENV PORT=80 \
