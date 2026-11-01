@@ -13,8 +13,14 @@ import re
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import quote
+from urllib.request import Request
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+from source_binding import public_source_status, source_url_names_revision, verify_public_source, SourceVerificationError
+from verify_deployment import safe_open, validated_origin
 
 
 SCHEMA_VERSION = "clef.real-pilot-manifest.v1"
@@ -199,13 +205,10 @@ def sanitized_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
 
 class NodeClient:
     def __init__(self, base_url: str, token: str, *, timeout: float = 15.0) -> None:
-        parsed = urlparse(base_url.rstrip("/"))
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
-            raise PilotVerificationError("API base must be an HTTP(S) origin without credentials")
-        if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-            raise PilotVerificationError("Non-local pilot verification requires HTTPS")
-        if parsed.query or parsed.fragment:
-            raise PilotVerificationError("API base must not contain a query or fragment")
+        try:
+            validated_origin(base_url)
+        except RuntimeError as error:
+            raise PilotVerificationError(str(error)) from None
         self.base_url = base_url.rstrip("/")
         self.token = _nonblank(token, "CLEF_PILOT_API_TOKEN")
         self.timeout = timeout
@@ -220,7 +223,7 @@ class NodeClient:
             data = canonical_json(body).encode("utf-8")
         request = Request(f"{self.base_url}{path}", data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with safe_open(request, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:
@@ -230,7 +233,7 @@ class NodeClient:
             raise PilotVerificationError(
                 f"{method} {path} returned HTTP {error.code}: {detail or 'request failed'}"
             ) from error
-        except (URLError, TimeoutError, json.JSONDecodeError) as error:
+        except (URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as error:
             raise PilotVerificationError(f"{method} {path} failed: {error}") from error
 
 
@@ -239,6 +242,17 @@ def collect_bundle(client: NodeClient, manifest: dict[str, Any]) -> dict[str, An
     work_key = quote(manifest["workKey"], safe="")
     permission_id = quote(manifest["permissionRequestId"], safe="")
     node = client.request("GET", "/v1/node/info")
+    node["sourceVerification"] = None
+    try:
+        node["sourceHttpStatus"] = public_source_status(
+            str(node.get("sourceCodeUrl") or ""),
+            timeout=client.timeout,
+        )
+        if manifest["requireProductionSource"] and node["sourceHttpStatus"] == 200:
+            node["sourceVerification"] = verify_public_source(
+                node["sourceCodeUrl"], node["sourceCodeRevision"], Path(__file__).resolve().parents[1])
+    except (OSError, TimeoutError, ValueError, SourceVerificationError):
+        node["sourceHttpStatus"] = None
     capabilities = client.request("GET", "/v1/integrations/capabilities")
     assets = client.request(
         "GET", f"/v1/organizations/{authority_org}/catalog/assets", authenticated=True
@@ -250,7 +264,7 @@ def collect_bundle(client: NodeClient, manifest: dict[str, Any]) -> dict[str, An
         "GET", f"/v1/permission-requests/{permission_id}", authenticated=True
     )
     receipt_id = _nonblank(permission.get("receiptId"), "permission.receiptId")
-    receipt = client.request("GET", f"/v1/receipts/{quote(receipt_id, safe='')}")
+    receipt = client.request("GET", f"/v1/receipts/{quote(receipt_id, safe='')}", authenticated=True)
     receipt_verification = client.request("POST", "/v1/receipts/verify", body={"receipt": receipt})
     settlement = client.request(
         "GET", f"/v1/permission-requests/{permission_id}/settlement", authenticated=True
@@ -260,7 +274,7 @@ def collect_bundle(client: NodeClient, manifest: dict[str, Any]) -> dict[str, An
     reconciliation_verification = None
     if reconciliations and reconciliations[-1].get("receiptId"):
         reconciliation_receipt = client.request(
-            "GET", f"/v1/receipts/{quote(reconciliations[-1]['receiptId'], safe='')}"
+            "GET", f"/v1/receipts/{quote(reconciliations[-1]['receiptId'], safe='')}", authenticated=True
         )
         reconciliation_verification = client.request(
             "POST", "/v1/receipts/verify", body={"receipt": reconciliation_receipt}
@@ -287,6 +301,27 @@ def _actor_key(actor: Any) -> tuple[str | None, str | None]:
     return ("organization_member", actor.get("userId"))
 
 
+def _allocate_minor_units(total_minor: int, beneficiaries: list[dict[str, Any]]) -> dict[str, int]:
+    allocations: dict[str, int] = {}
+    remainders: list[tuple[int, str, str]] = []
+    assigned = 0
+    for beneficiary in beneficiaries:
+        beneficiary_id = beneficiary["id"]
+        numerator = total_minor * beneficiary["shareBps"]
+        amount = numerator // 10000
+        allocations[beneficiary_id] = amount
+        assigned += amount
+        remainders.append(
+            (numerator % 10000, str(beneficiary.get("identifier") or ""), beneficiary_id)
+        )
+    for _, _, beneficiary_id in sorted(
+        remainders,
+        key=lambda row: (-row[0], row[1], row[2]),
+    )[: total_minor - assigned]:
+        allocations[beneficiary_id] += 1
+    return allocations
+
+
 def evaluate_pilot(
     manifest: dict[str, Any], bundle: dict[str, Any], *, synthetic_run: bool = False
 ) -> dict[str, Any]:
@@ -311,15 +346,12 @@ def evaluate_pilot(
         keyId=node.get("keyId"),
         ephemeralSigningKey=node.get("ephemeralSigningKey"),
     )
-    source_url = urlparse(str(node.get("sourceCodeUrl") or ""))
     production_source_ok = (
         node.get("softwareLicense") == "AGPL-3.0-only"
-        and source_url.scheme == "https"
-        and bool(source_url.hostname)
-        and not source_url.username
-        and not source_url.password
-        and not source_url.fragment
-        and node.get("sourceCodeRevision") not in {None, "", "development"}
+        and source_url_names_revision(node.get("sourceCodeUrl"), node.get("sourceCodeRevision"))
+        and node.get("sourceHttpStatus") == 200
+        and (node.get("sourceVerification") or {}).get("verified") is True
+        and (node.get("sourceVerification") or {}).get("revision") == node.get("sourceCodeRevision")
     )
     check(
         "corresponding_source",
@@ -328,6 +360,8 @@ def evaluate_pilot(
         softwareLicense=node.get("softwareLicense"),
         sourceCodeRevision=node.get("sourceCodeRevision"),
         sourceCodeUrlConfigured=bool(node.get("sourceCodeUrl")),
+        sourceHttpStatus=node.get("sourceHttpStatus"),
+        sourceVerification=node.get("sourceVerification"),
         required=manifest["requireProductionSource"],
     )
 
@@ -455,8 +489,29 @@ def evaluate_pilot(
     receipt_evidence = receipt_authority.get("evidence") or {}
     evidence_expected = manifest["authorityEvidence"]
     receipt_verification = bundle.get("receiptVerification") or {}
+    signed_permission = receipt_payload.get("permission") or {}
+    signed_decision = receipt_payload.get("decision") or {}
+    signed_requester = signed_permission.get("requestedBy") or {}
+    grant_matches_permission = (
+        signed_permission.get("requestId") == permission.get("id")
+        and all(
+            key in signed_permission and signed_permission[key] == permission.get(key)
+            for key in ("workKey", "intendedUsage", "territory", "termStart", "termEnd", "context")
+        )
+        and receipt_payload.get("provenance") == permission.get("provenance")
+        and receipt_payload.get("status") == "permissioned"
+        and signed_decision.get("result") == "approved"
+        and _actor_key(signed_decision.get("actor")) == reviewer_key
+        and (signed_decision.get("actor") or {}).get("organizationId") == manifest["authorityOrganizationId"]
+        and (receipt_payload.get("requester") or {}).get("organizationId") == manifest["requesterOrganizationId"]
+        and signed_requester.get("organizationId") == manifest["requesterOrganizationId"]
+        and _actor_key(signed_requester) == _actor_key(permission.get("requestedBy"))
+        and bool((permission.get("authority") or {}).get("claimId"))
+        and receipt_authority.get("claimId") == permission["authority"]["claimId"]
+    )
     receipt_ok = (
         receipt_verification.get("valid") is True
+        and grant_matches_permission
         and receipt_payload.get("receiptId") == permission.get("receiptId")
         and (receipt_payload.get("node") or {}).get("id") == node.get("nodeId")
         and (receipt_payload.get("node") or {}).get("keyId") == node.get("keyId")
@@ -472,13 +527,14 @@ def evaluate_pilot(
     check(
         "signed_authority_receipt",
         receipt_ok,
-        "Grant receipt, node identity, authority scope, evidence fingerprint, or signature does not match",
+        "Signed grant does not match the permission, assigned reviewer, requester, authority evidence, node identity, or signature checks",
         receiptId=permission.get("receiptId"),
         signatureValid=receipt_verification.get("signatureValid"),
         payloadHashValid=receipt_verification.get("payloadHashValid"),
         transparencyHashValid=receipt_verification.get("transparencyHashValid"),
         authorityStatus=receipt_authority.get("verificationStatus"),
         evidenceFingerprintMatched=receipt_evidence.get("documentSha256") == evidence_expected["documentSha256"],
+        grantMatchesPermission=grant_matches_permission,
     )
 
     requested_actor = _actor_key((receipt_payload.get("permission") or {}).get("requestedBy"))
@@ -495,7 +551,19 @@ def evaluate_pilot(
     reports = permission.get("usageReports") or []
     report = reports[-1] if reports else {}
     checks_result = report.get("automatedChecks") or {}
-    metadata_results = checks_result.get("metadataExactMatches") or {}
+    metadata_fields = attribution.get("metadataFields")
+    required_metadata_keys = set(metadata_fields) if isinstance(metadata_fields, dict) else set()
+    metadata_results = checks_result.get("metadataExactMatches")
+    metadata_exact = (
+        isinstance(metadata_results, dict)
+        and set(metadata_results) == required_metadata_keys
+        and all(metadata_results[key] is True for key in required_metadata_keys)
+    )
+    backlink_exact = (
+        checks_result.get("backlinkExactMatch") is True
+        if attribution.get("backlinkRequired") is True
+        else checks_result.get("backlinkExactMatch") in {True, None}
+    )
     reviews = report.get("reviews") or []
     review = reviews[-1] if reviews else {}
     report_url = report.get("publicationUrl") or ""
@@ -503,8 +571,8 @@ def evaluate_pilot(
         len(reports) > 0
         and hashlib.sha256(report_url.encode("utf-8")).hexdigest() == manifest["publicationUrlSha256"]
         and checks_result.get("creditTextExactMatch") is True
-        and checks_result.get("backlinkExactMatch") in {True, None}
-        and all(value is True for value in metadata_results.values())
+        and backlink_exact
+        and metadata_exact
         and checks_result.get("reportedWithinDeadline") is True
         and checks_result.get("effect") == "comparison_only"
         and report.get("currentReviewOutcome") == "compliant"
@@ -521,7 +589,10 @@ def evaluate_pilot(
         usageReportId=report.get("id"),
         publicationUrlHashMatched=hashlib.sha256(report_url.encode("utf-8")).hexdigest() == manifest["publicationUrlSha256"] if report_url else False,
         creditExact=checks_result.get("creditTextExactMatch"),
-        metadataExact=all(value is True for value in metadata_results.values()),
+        backlinkRequired=attribution.get("backlinkRequired") is True,
+        backlinkExact=backlink_exact,
+        requiredMetadataFields=len(required_metadata_keys),
+        metadataExact=metadata_exact,
         reportedWithinDeadline=checks_result.get("reportedWithinDeadline"),
         complianceOutcome=review.get("outcome"),
         assignedReviewerReviewed=_actor_key(review.get("reviewedBy")) == reviewer_key,
@@ -531,9 +602,75 @@ def evaluate_pilot(
     totals = settlement.get("totals") or {}
     beneficiaries = settlement.get("beneficiaries") or []
     entries = settlement.get("entries") or []
-    financial_entries = [row for row in entries if row.get("kind") in {"payment_received", "payout"}]
-    financial_evidence_ok = bool(financial_entries) and all(
-        bool(row.get("externalReference")) and bool(row.get("evidence")) for row in financial_entries
+    beneficiary_ids = [row.get("id") for row in beneficiaries]
+    beneficiaries_valid = (
+        bool(beneficiaries)
+        and all(
+            isinstance(row, dict)
+            and isinstance(row.get("id"), str)
+            and bool(row["id"])
+            and isinstance(row.get("shareBps"), int)
+            and 0 < row["shareBps"] <= 10000
+            for row in beneficiaries
+        )
+        and len(set(beneficiary_ids)) == len(beneficiary_ids)
+        and sum(row.get("shareBps", 0) for row in beneficiaries) == 10000
+    )
+    obligation_minor = totals.get("obligationMinor")
+    allocations = (
+        _allocate_minor_units(obligation_minor, beneficiaries)
+        if beneficiaries_valid and isinstance(obligation_minor, int) and obligation_minor > 0
+        else {}
+    )
+    financial_kinds = {"payment_received", "payment_reversal", "payout", "payout_reversal"}
+    financial_entries = [row for row in entries if row.get("kind") in financial_kinds]
+    financial_entries_valid = bool(financial_entries) and all(
+        isinstance(row.get("amountMinor"), int)
+        and row.get("amountMinor", 0) > 0
+        and bool(row.get("externalReference"))
+        and bool(row.get("evidence"))
+        and (
+            row.get("beneficiaryId") in allocations
+            if row.get("kind") in {"payout", "payout_reversal"}
+            else row.get("beneficiaryId") in {None, ""}
+        )
+        for row in financial_entries
+    )
+    payment_entries = [row for row in financial_entries if row.get("kind") in {"payment_received", "payment_reversal"}]
+    payout_entries = [row for row in financial_entries if row.get("kind") in {"payout", "payout_reversal"}]
+    payment_minor = sum(
+        (1 if row.get("kind") == "payment_received" else -1) * row.get("amountMinor", 0)
+        for row in payment_entries
+    )
+    payout_by_beneficiary = {
+        beneficiary_id: sum(
+            (1 if row.get("kind") == "payout" else -1) * row.get("amountMinor", 0)
+            for row in payout_entries
+            if row.get("beneficiaryId") == beneficiary_id
+        )
+        for beneficiary_id in allocations
+    }
+    payments_and_payouts_complete = (
+        any(row.get("kind") == "payment_received" for row in payment_entries)
+        and all(any(row.get("kind") == "payout" and row.get("beneficiaryId") == beneficiary_id for row in payout_entries) for beneficiary_id in allocations)
+        and payment_minor == obligation_minor
+        and payout_by_beneficiary == allocations
+    )
+    reported_beneficiary_totals = {
+        row.get("beneficiaryId"): row
+        for row in (totals.get("beneficiaries") or [])
+        if isinstance(row, dict)
+    }
+    reported_totals_match = (
+        totals.get("paymentReceivedMinor") == payment_minor
+        and totals.get("payoutMinor") == sum(payout_by_beneficiary.values())
+        and set(reported_beneficiary_totals) == set(allocations)
+        and all(
+            reported_beneficiary_totals[beneficiary_id].get("obligationMinor") == amount
+            and reported_beneficiary_totals[beneficiary_id].get("payoutMinor") == payout_by_beneficiary[beneficiary_id]
+            and reported_beneficiary_totals[beneficiary_id].get("varianceMinor") == 0
+            for beneficiary_id, amount in allocations.items()
+        )
     )
     settlement_ok = (
         settlement.get("permissionRequestId") == manifest["permissionRequestId"]
@@ -542,12 +679,14 @@ def evaluate_pilot(
         and settlement.get("assertionType") == "paid"
         and settlement.get("reconciliationCurrent") is True
         and totals.get("balanced") is True
-        and isinstance(totals.get("obligationMinor"), int)
-        and totals.get("obligationMinor", 0) > 0
+        and isinstance(obligation_minor, int)
+        and obligation_minor > 0
         and totals.get("paymentVarianceMinor") == 0
         and totals.get("payoutVarianceMinor") == 0
-        and sum(row.get("shareBps", 0) for row in beneficiaries) == 10000
-        and financial_evidence_ok
+        and beneficiaries_valid
+        and financial_entries_valid
+        and payments_and_payouts_complete
+        and reported_totals_match
     )
     check(
         "reconciled_external_payment",
@@ -560,19 +699,32 @@ def evaluate_pilot(
         paymentVarianceMinor=totals.get("paymentVarianceMinor"),
         payoutVarianceMinor=totals.get("payoutVarianceMinor"),
         beneficiaryShareBps=sum(row.get("shareBps", 0) for row in beneficiaries),
-        externalEvidenceComplete=financial_evidence_ok,
+        externalEvidenceComplete=financial_entries_valid,
+        paymentEntries=len(payment_entries),
+        payoutEntries=len(payout_entries),
+        beneficiaryPayoutsComplete=payments_and_payouts_complete,
+        reportedTotalsMatched=reported_totals_match,
     )
 
     reconciliations = settlement.get("reconciliations") or []
     latest_reconciliation = reconciliations[-1] if reconciliations else {}
     reconciliation_receipt = bundle.get("reconciliationReceipt") or {}
     reconciliation_payload = reconciliation_receipt.get("payload") or {}
+    reconciliation_settlement = reconciliation_payload.get("settlement") or {}
     reconciliation_verification = bundle.get("reconciliationVerification") or {}
     reconciliation_ok = (
         latest_reconciliation.get("assertionType") == "paid"
         and latest_reconciliation.get("ledgerDigest") == settlement.get("ledgerDigest")
         and latest_reconciliation.get("receiptId") == reconciliation_payload.get("receiptId")
+        and latest_reconciliation.get("entryCount") == len(entries)
+        and latest_reconciliation.get("totals") == totals
+        and reconciliation_settlement.get("id") == settlement.get("id")
+        and reconciliation_settlement.get("reconciliationId") == latest_reconciliation.get("id")
+        and reconciliation_settlement.get("ledgerDigest") == settlement.get("ledgerDigest")
+        and reconciliation_settlement.get("entryCount") == len(entries)
+        and reconciliation_settlement.get("totals") == totals
         and reconciliation_verification.get("valid") is True
+        and reconciliation_verification.get("signatureValid") is True
     )
     check(
         "signed_settlement_reconciliation",
@@ -581,6 +733,7 @@ def evaluate_pilot(
         reconciliationId=latest_reconciliation.get("id"),
         receiptId=latest_reconciliation.get("receiptId"),
         ledgerDigestMatched=latest_reconciliation.get("ledgerDigest") == settlement.get("ledgerDigest"),
+        receiptSettlementMatched=reconciliation_settlement.get("id") == settlement.get("id"),
         signatureValid=reconciliation_verification.get("signatureValid"),
     )
 

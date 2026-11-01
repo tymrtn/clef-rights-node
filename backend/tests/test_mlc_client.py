@@ -47,7 +47,7 @@ def test_mlc_client_reuses_token_and_normalizes_search_without_logging_credentia
             _response(200, {"results": [{"mlcSongCode": "WORK-2"}]}),
         ]
     )
-    client = MLCClient("member@example.com", "private-password", session=session)
+    client = MLCClient("member@example.com", "fixture-private-password", session=session)
 
     first = client.search_songcode(title="  Example Work  ")
     second = client.search_songcode(writer_lastname="  Writer  ")
@@ -65,6 +65,36 @@ def test_mlc_client_reuses_token_and_normalizes_search_without_logging_credentia
     assert client.last_verified_at is not None
 
 
+def test_mlc_client_resolves_recording_song_codes_to_work_iswcs():
+    session = FakeSession(
+        [
+            _response(200, {"idToken": "token-1", "expiresIn": 3600}),
+            _response(
+                200,
+                [
+                    {
+                        "mlcSongCode": "WORK-1",
+                        "iswc": "T1234567890",
+                        "primaryTitle": "Example Work",
+                    }
+                ],
+            ),
+        ]
+    )
+    client = MLCClient("member@example.com", "fixture-private-password", session=session)
+
+    works = client.get_works([" WORK-1 ", "WORK-1"])
+
+    assert works[0]["iswc"] == "T1234567890"
+    assert session.calls[1][0] == "https://public-api.themlc.com/works"
+    assert session.calls[1][1]["json"] == [{"mlcsongCode": "WORK-1"}]
+
+    with pytest.raises(MLCQueryError, match="At least one"):
+        client.get_works([])
+    with pytest.raises(MLCQueryError, match="limited to 100"):
+        client.get_works([f"WORK-{index}" for index in range(101)])
+
+
 def test_mlc_client_refreshes_once_after_unauthorized_search():
     session = FakeSession(
         [
@@ -74,7 +104,7 @@ def test_mlc_client_refreshes_once_after_unauthorized_search():
             _response(200, [{"isrc": "USAAA2600001"}]),
         ]
     )
-    client = MLCClient("member@example.com", "private-password", session=session)
+    client = MLCClient("member@example.com", "fixture-private-password", session=session)
 
     assert client.search_recordings(isrc=" USAAA2600001 ") == [
         {"isrc": "USAAA2600001"}
@@ -84,11 +114,11 @@ def test_mlc_client_refreshes_once_after_unauthorized_search():
 
 
 def test_mlc_client_fails_closed_with_safe_transport_and_protocol_errors():
-    unavailable = FakeSession([requests.ConnectionError("private-password leaked upstream")])
-    client = MLCClient("member@example.com", "private-password", session=unavailable)
+    unavailable = FakeSession([requests.ConnectionError("fixture-private-password leaked upstream")])
+    client = MLCClient("member@example.com", "fixture-private-password", session=unavailable)
     with pytest.raises(MLCTransportError) as failure:
         client.search_songcode(title="Example")
-    assert "private-password" not in str(failure.value)
+    assert "fixture-private-password" not in str(failure.value)
     assert client.reachable is False
 
     malformed = FakeSession(
@@ -98,20 +128,33 @@ def test_mlc_client_fails_closed_with_safe_transport_and_protocol_errors():
         ]
     )
     with pytest.raises(MLCProtocolError, match="result list"):
-        MLCClient("member@example.com", "private-password", session=malformed).search_songcode(
+        MLCClient("member@example.com", "fixture-private-password", session=malformed).search_songcode(
             title="Example"
         )
 
     empty = FakeSession([])
     with pytest.raises(MLCQueryError, match="title or writer"):
-        MLCClient("member@example.com", "private-password", session=empty).search_songcode()
+        MLCClient("member@example.com", "fixture-private-password", session=empty).search_songcode()
+
+
+@pytest.mark.parametrize("status", [200, 204])
+def test_mlc_client_only_accepts_explicit_no_content_as_no_results(status):
+    empty = _response(status, None)
+    empty.raw = io.BytesIO(b"")
+    session = FakeSession([_response(200, {"idToken": "token", "expiresIn": 3600}), empty])
+    client = MLCClient("member@example.com", "fixture-private-password", session=session)
+    if status == 204:
+        assert client.search_recordings(isrc="USAAA2600001") == []
+    else:
+        with pytest.raises(MLCProtocolError, match="non-JSON"):
+            client.search_recordings(isrc="USAAA2600001")
 
 
 def test_mlc_adapter_reports_live_reachability_without_expanding_authority():
     adapter = MLCAdapter(
         enabled=True,
         username="member@example.com",
-        password="private-password",
+        password="fixture-private-password",
         base_url="https://public-api.themlc.com",
         authorized_capabilities={"catalog_lookup"},
     )
@@ -129,7 +172,7 @@ def test_mlc_adapter_reports_live_reachability_without_expanding_authority():
 def test_mlc_client_refuses_redirects_and_bounds_streamed_response_bytes():
     redirected = FakeSession([_response(302, {"location": "elsewhere"})])
     with pytest.raises(MLCTransportError, match="authentication returned HTTP 302"):
-        MLCClient("member@example.com", "private-password", session=redirected).search_songcode(
+        MLCClient("member@example.com", "fixture-private-password", session=redirected).search_songcode(
             title="Example"
         )
     assert redirected.calls[0][1]["allow_redirects"] is False
@@ -138,7 +181,7 @@ def test_mlc_client_refuses_redirects_and_bounds_streamed_response_bytes():
     oversized = FakeSession([_response(200, [{"payload": "x" * 100}])])
     client = MLCClient(
         "member@example.com",
-        "private-password",
+        "fixture-private-password",
         session=oversized,
         max_response_bytes=32,
     )

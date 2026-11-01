@@ -21,6 +21,30 @@ from sqlalchemy.orm import declarative_base
 Base = declarative_base()
 
 
+class SandboxTourRecord(Base):
+    """One recoverable fictional example per anonymous sandbox user."""
+    __tablename__ = "rn_sandbox_tours"
+    user_id = Column(String, ForeignKey("rc_users.id"), primary_key=True)
+    lease_token = Column(String, nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    manifest = Column(JSON, nullable=True)
+
+
+class CatalogPublicationRecord(Base):
+    """An administrator's explicit consent to share a particular catalog projection."""
+    __tablename__ = "rn_catalog_publications"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    org_id = Column(String, ForeignKey("rn_organizations.id"), nullable=False, index=True)
+    authority_claim_id = Column(String, ForeignKey("rn_authority_claims.id"), nullable=False, unique=True)
+    public_payload = Column(JSON, nullable=False)
+    search_text = Column(Text, nullable=False)
+    basis_hash = Column(String, nullable=False)
+    revision = Column(Integer, nullable=False, default=1)
+    approved_by_user_id = Column(String, ForeignKey("rc_users.id"), nullable=False)
+    approved_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    withdrawn_at = Column(DateTime, nullable=True)
+
+
 class RightsContractRecord(Base):
     __tablename__ = "rights_contracts"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -352,6 +376,23 @@ class WebhookAttemptRecord(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True, nullable=False)
 
 
+class ServiceHeartbeatRecord(Base):
+    """Latest non-secret operational signal from a supervised node service."""
+
+    __tablename__ = "rn_service_heartbeats"
+    service_name = Column(String, primary_key=True)
+    status = Column(String, index=True, nullable=False)
+    last_attempt_at = Column(DateTime, index=True, nullable=False)
+    last_success_at = Column(DateTime, index=True, nullable=True)
+    details = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
 class AuditEventRecord(Base):
     __tablename__ = "rn_audit_events"
     __table_args__ = (
@@ -670,6 +711,48 @@ class PermissionReceiptRecord(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
+class OrganizationPrivacyRecord(Base):
+    __tablename__ = "rn_organization_privacy"
+    org_id = Column(String, ForeignKey("rn_organizations.id"), primary_key=True)
+    publish_public_receipts = Column(Boolean, nullable=False, default=False)
+    receipt_retention_days = Column(Integer, nullable=True)
+    legal_hold = Column(Boolean, nullable=False, default=False)
+    version = Column(Integer, nullable=False, default=1)
+    __table_args__ = (CheckConstraint("receipt_retention_days IS NULL OR receipt_retention_days BETWEEN 1 AND 36500", name="ck_rn_privacy_retention"),)
+
+
+class ReceiptDisclosureRecord(Base):
+    """A separately signed public statement and a deletable private opening."""
+    __tablename__ = "rn_receipt_disclosures"
+    receipt_id = Column(String, ForeignKey("rn_permission_receipts.id"), primary_key=True)
+    public_id = Column(String, unique=True, nullable=False)
+    authority_org_id = Column(String, ForeignKey("rn_organizations.id"), index=True, nullable=False)
+    requester_org_id = Column(String, ForeignKey("rn_organizations.id"), index=True, nullable=False)
+    commitment_nonce = Column(String, nullable=True)
+    private_commitment = Column(String, nullable=False)
+    public_receipt = Column(JSON, nullable=True)
+    public_sequence = Column(Integer, unique=True, nullable=True)
+    public_entry_hash = Column(String, unique=True, nullable=True)
+    retain_until = Column(DateTime, nullable=True)
+    withdrawn_at = Column(DateTime, nullable=True)
+    erased_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
+class PrivacyErasureRequestRecord(Base):
+    __tablename__ = "rn_privacy_erasure_requests"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    org_id = Column(String, ForeignKey("rn_organizations.id"), index=True, nullable=False)
+    kind = Column(String, nullable=False)
+    resource_id = Column(String, index=True, nullable=False)
+    resource_hash = Column(String, nullable=False)
+    required_org_ids = Column(JSON, nullable=False)
+    approved_org_ids = Column(JSON, nullable=False, default=list)
+    status = Column(String, nullable=False, default="requested")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+
 class DdexExchangeRecord(Base):
     __tablename__ = "rn_ddex_exchanges"
     __table_args__ = (
@@ -917,6 +1000,7 @@ class CatalogImportBatchRecord(Base):
     org_id = Column(String, ForeignKey("rn_organizations.id"), index=True, nullable=False)
     filename = Column(String, nullable=False)
     file_sha256 = Column(String, index=True, nullable=False)
+    review_digest = Column(String(64), nullable=True)
     status = Column(String, index=True, nullable=False, default="preview")
     summary = Column(JSON, nullable=False, default=dict)
     created_by_user_id = Column(String, ForeignKey("rc_users.id"), nullable=True)
@@ -972,6 +1056,7 @@ class CatalogImportRowRecord(Base):
     row_number = Column(Integer, nullable=False)
     source_json = Column(JSON, nullable=False)
     normalized_json = Column(JSON, nullable=False, default=dict)
+    review_basis = Column(String(64), nullable=True)
     status = Column(String, index=True, nullable=False)
     errors = Column(JSON, nullable=False, default=list)
     existing_item_id = Column(String, ForeignKey("rn_catalog_assets.id"), index=True, nullable=True)

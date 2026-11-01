@@ -25,11 +25,23 @@ export function isCurrentValidation(requestId: number, currentRequestId: number)
   return requestId === currentRequestId;
 }
 
+export type ValidationStatus = "idle" | "pending" | "valid" | "unavailable";
+
+export function canSaveValidatedDraft(status: ValidationStatus): boolean {
+  return status === "valid";
+}
+
+export function normalizeRestrictionState(value: unknown): RestrictionState | "unknown" {
+  return value === "allowed" || value === "conditional" || value === "denied"
+    ? value
+    : "unknown";
+}
+
 type Props = {
   row: any;
   data: { contract: any; matrix: RightsMatrix; version: number } | null;
   onClose: () => void;
-  onSave: (contract: any) => Promise<void>;
+  onSave: (contract: any) => Promise<void | boolean>;
   loading: boolean;
 };
 
@@ -40,6 +52,7 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
   const [aiLoading, setAiLoading] = React.useState(false);
   const [aiReasoning, setAiReasoning] = React.useState("");
   const [issues, setIssues] = React.useState<any[]>([]);
+  const [validationStatus, setValidationStatus] = React.useState<ValidationStatus>("idle");
   const [activeTab, setActiveTab] = React.useState<"edit" | "preview">("edit");
   const [approvals, setApprovals] = React.useState<any[]>([]);
   const [comments, setComments] = React.useState<any[]>([]);
@@ -60,6 +73,7 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
       setDraft(null);
     }
     setIssues([]);
+    setValidationStatus("idle");
   }, [data, clone]);
 
   // Guardrails: validate draft and surface conflicts (debounced).
@@ -67,9 +81,10 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
     const requestId = ++validationRequestIdRef.current;
     if (!draft) {
       setIssues([]);
+      setValidationStatus("idle");
       return;
     }
-    setIssues([]);
+    setValidationStatus("pending");
     const id = window.setTimeout(async () => {
       try {
         const res = await fetch("/api/rights/validate", {
@@ -80,9 +95,12 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
         const data = await checkedJson(res, "Rights validation");
         if (isCurrentValidation(requestId, validationRequestIdRef.current)) {
           setIssues(data.issues || []);
+          setValidationStatus("valid");
         }
       } catch {
-        // ignore
+        if (isCurrentValidation(requestId, validationRequestIdRef.current)) {
+          setValidationStatus("unavailable");
+        }
       }
     }, 250);
     return () => {
@@ -313,7 +331,7 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
     setAiLoading(true);
     setAiReasoning("");
     try {
-      // Use artist from MLC raw data (performer field) as canonical source
+      // Use artist from The MLC raw data (performer field) as canonical source
       const artist = row.raw?.artist || row.artist || "Unknown Artist";
       const response = await fetch("/api/rights/recommend-macro", {
         method: "POST",
@@ -340,11 +358,15 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
 
   async function handleSave() {
     if (!draft || loading) return;
+    if (!canSaveValidatedDraft(validationStatus)) {
+      setError("Wait for a successful policy validation before saving.");
+      return;
+    }
     setSaving(true);
     setError("");
     try {
-      await onSave(draft);
-      onClose();
+      const stillCurrent = await onSave(draft);
+      if (stillCurrent !== false) onClose();
     } catch (err: any) {
       setError(err.message || "Failed to save");
     } finally {
@@ -416,6 +438,15 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
           </section>
         )}
 
+        {validationStatus === "unavailable" && (
+          <section className="border border-red-200 bg-red-50 rounded-lg p-4" role="alert">
+            <h3 className="text-sm font-semibold text-red-900">Policy validation unavailable</h3>
+            <p className="text-xs text-red-800 mt-1">
+              Existing findings remain visible. Saving is paused until validation succeeds.
+            </p>
+          </section>
+        )}
+
         <div
           className="flex gap-2"
           role="tablist"
@@ -456,7 +487,7 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
           className="bg-blue-50 border border-blue-200 rounded-lg p-4"
         >
           <h3 className="text-sm font-semibold text-gray-900 mb-3">
-            MLC Catalog Information
+            The MLC Catalog Information
           </h3>
           <div className="grid grid-cols-2 gap-3 text-sm">
             <div>
@@ -533,7 +564,7 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
           </div>
           <details className="mt-3">
             <summary className="cursor-pointer text-xs text-gray-600 hover:text-gray-900">
-              View raw MLC data
+              View raw The MLC data
             </summary>
             <pre className="mt-2 bg-white p-3 border border-gray-200 rounded text-xs overflow-x-auto">
               {JSON.stringify(row.raw, null, 2)}
@@ -635,8 +666,9 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
               className="grid grid-cols-1 gap-3"
             >
               {RESTRICTION_KEYS.map((key) => {
-                const state = (draft.artist?.restrictionMatrix?.[key] ||
-                  "allowed") as RestrictionState;
+                const state = normalizeRestrictionState(
+                  draft.artist?.restrictionMatrix?.[key]
+                );
                 const meta = RESTRICTION_CATEGORIES[key];
                 return (
                   <div
@@ -654,6 +686,11 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
                         </div>
                       </div>
                     </div>
+                    {state === "unknown" && (
+                      <p className="mb-2 text-xs font-medium text-amber-700">
+                        Not specified. Choose an explicit policy before relying on this category.
+                      </p>
+                    )}
                     <div className="flex gap-2">
                       <button
                         className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
@@ -984,8 +1021,11 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
                   draft.artist?.approval?.approvalWindowDays ?? 0;
                 const deniedRestrictions = RESTRICTION_KEYS.filter(
                   (rk) =>
-                    (draft.artist?.restrictionMatrix?.[rk] || "allowed") ===
-                    "denied"
+                    normalizeRestrictionState(draft.artist?.restrictionMatrix?.[rk]) === "denied"
+                );
+                const unknownRestrictions = RESTRICTION_KEYS.filter(
+                  (rk) =>
+                    normalizeRestrictionState(draft.artist?.restrictionMatrix?.[rk]) === "unknown"
                 );
                 return (
                   <div
@@ -1020,6 +1060,12 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
                             Restricted:{" "}
                             {deniedRestrictions.slice(0, 3).join(", ")}
                             {deniedRestrictions.length > 3 ? "…" : ""}
+                          </li>
+                        )}
+                        {unknownRestrictions.length > 0 && (
+                          <li className="text-amber-700">
+                            Unspecified: {unknownRestrictions.slice(0, 3).join(", ")}
+                            {unknownRestrictions.length > 3 ? "…" : ""}
                           </li>
                         )}
                         <li>Contact: rights@your-org.example</li>
@@ -1169,14 +1215,22 @@ export function RightsDrawer({ row, data, onClose, onSave, loading }: Props) {
           </button>
           <button
             className={`px-5 py-2 rounded-lg text-white ${
-              saving || loading
+              saving || loading || !canSaveValidatedDraft(validationStatus)
                 ? "bg-blue-300 cursor-not-allowed"
                 : "bg-blue-600 hover:bg-blue-700"
             }`}
             onClick={handleSave}
-            disabled={saving || loading}
+            disabled={saving || loading || !canSaveValidatedDraft(validationStatus)}
           >
-            {saving ? "Saving…" : loading ? "Loading…" : "Save changes"}
+            {saving
+              ? "Saving…"
+              : loading
+              ? "Loading…"
+              : validationStatus === "pending" || validationStatus === "idle"
+              ? "Validating…"
+              : validationStatus === "unavailable"
+              ? "Validation unavailable"
+              : "Save changes"}
           </button>
         </div>
       </div>

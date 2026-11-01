@@ -14,6 +14,19 @@ from urllib3.util.retry import Retry
 logger = logging.getLogger("clef.mlc")
 
 
+def mlc_source_scope() -> dict[str, Any]:
+    """Describe the provider's data role separately from catalog observations."""
+    return {
+        "providerName": "The MLC",
+        "publishingAdministrationTerritory": "US",
+        "recordingMetadataSource": "digital_service_providers",
+        "recordingMetadataTreatment": "as_received",
+        "masterOwnershipEvidenceProvided": False,
+        "masterRightsSharesProvided": False,
+        "permissionAuthoritySource": "separately_reviewed_rightsholder_evidence",
+    }
+
+
 class MLCClientError(RuntimeError):
     """Base class for safe, credential-free MLC client failures."""
 
@@ -91,7 +104,7 @@ class MLCClient:
             .isoformat()
         )
 
-    def _post(self, path: str, *, body: dict[str, Any], headers: dict[str, str] | None = None):
+    def _post(self, path: str, *, body: Any, headers: dict[str, str] | None = None):
         try:
             response = self._session.post(
                 f"{self.base_url}{path}",
@@ -173,7 +186,7 @@ class MLCClient:
         self._authenticate()
         return {"Authorization": f"Bearer {self._id_token}"}
 
-    def _search(self, path: str, body: dict[str, Any]) -> list[dict[str, Any]]:
+    def _search(self, path: str, body: Any) -> list[dict[str, Any]]:
         response = self._post(path, body=body, headers=self._authorization_headers())
         if response.status_code == 401:
             self._id_token = None
@@ -189,6 +202,10 @@ class MLCClient:
             raise MLCAuthenticationError("MLC credentials were rejected")
         if not 200 <= response.status_code < 300:
             raise MLCTransportError(f"MLC search returned HTTP {response.status_code}")
+        # The live search endpoint returns HTTP 204 with an empty body for
+        # some ISRCs with no results. Other empty/malformed responses fail closed.
+        if response.status_code == 204 and not response.content:
+            return []
         data = self._response_json(response)
         if isinstance(data, dict):
             data = data.get("results", data.get("data"))
@@ -231,3 +248,20 @@ class MLCClient:
         if not body:
             raise MLCQueryError("An artist, title, or ISRC is required")
         return self._search("/search/recordings", body)
+
+    def get_works(self, mlc_song_codes: list[str]) -> list[dict[str, Any]]:
+        codes = list(
+            dict.fromkeys(
+                code.strip()
+                for code in mlc_song_codes
+                if isinstance(code, str) and code.strip()
+            )
+        )
+        if not codes:
+            raise MLCQueryError("At least one MLC song code is required")
+        if len(codes) > 100:
+            raise MLCQueryError("A work retrieval request is limited to 100 MLC song codes")
+        return self._search(
+            "/works",
+            [{"mlcsongCode": code} for code in codes],
+        )

@@ -1,12 +1,31 @@
 import { describe, expect, it } from "vitest";
 
-import { canOrganizationManageRights, catalogSelectionFromMlcResult, createAiPolicyDefaults, createPolicyDefaults, isPublicSandbox, localDateTimeInputValue, policyEditorScopeKey, requiresOrganizationSetup } from "./RightsNodeApp";
+import { canOrganizationManageRights, catalogSelectionFromMlcResult, createAiPolicyDefaults, createPolicyDefaults, defaultControlledRightsForOrganizationType, isAiUsageKey, isPublicSandbox, localDateTimeInputValue, organizationConsoleScopeKey, policyEditorScopeKey, requiresOrganizationSetup } from "./RightsNodeApp";
+import { onboardingStateClasses } from "./OnboardingChecklist";
+import { isReadinessResultCurrent, readinessStateClasses, resolveRemediationHref } from "./DeploymentReadinessPanel";
 
 describe("deployment identity", () => {
   it("identifies only the public synthetic sandbox", () => {
     expect(isPublicSandbox({ deploymentMode: "public_sandbox" })).toBe(true);
     expect(isPublicSandbox({ deploymentMode: "adopter_staging" })).toBe(false);
     expect(isPublicSandbox(null)).toBe(false);
+  });
+});
+
+describe("operator readiness presentation", () => {
+  it("resolves remediation instructions against the deployed source offer", () => {
+    expect(resolveRemediationHref("docs/RAILWAY_DEPLOYMENT.md#configure-email", "https://github.com/example/node/tree/v1")).toBe(
+      "https://github.com/example/node/tree/v1/docs/RAILWAY_DEPLOYMENT.md#configure-email",
+    );
+    expect(readinessStateClasses("blocked")).toContain("red");
+    expect(readinessStateClasses("ready")).toContain("emerald");
+    expect(isReadinessResultCurrent("2026-08-14T12:00:00Z", Date.parse("2026-08-14T12:00:59Z"))).toBe(true);
+    expect(isReadinessResultCurrent("2026-08-14T12:00:00Z", Date.parse("2026-08-14T12:01:01Z"))).toBe(false);
+  });
+
+  it("distinguishes completed and pending onboarding evidence", () => {
+    expect(onboardingStateClasses("complete")).toContain("emerald");
+    expect(onboardingStateClasses("pending")).toContain("blue");
   });
 });
 
@@ -27,6 +46,7 @@ describe("MLC catalog selection", () => {
 describe("policy editor tenant scope", () => {
   it("changes the React remount key when organizations change", () => {
     expect(policyEditorScopeKey("org-a")).not.toBe(policyEditorScopeKey("org-b"));
+    expect(organizationConsoleScopeKey("org-a")).not.toBe(organizationConsoleScopeKey("org-b"));
   });
 });
 
@@ -44,6 +64,14 @@ describe("operator onboarding", () => {
     expect(requiresOrganizationSetup({ user: { id: "member", email: "member@example.test", nodeRole: "member" }, organizations: [] })).toBe(true);
     expect(requiresOrganizationSetup({ user: { id: "guest", email: "sandbox-123@sandbox.invalid", nodeRole: "admin" }, organizations: [] })).toBe(true);
   });
+
+  it("uses conservative type-specific rights suggestions", () => {
+    expect(defaultControlledRightsForOrganizationType("label")).toEqual(["master"]);
+    expect(defaultControlledRightsForOrganizationType("publisher")).toEqual(["composition", "lyrics"]);
+    expect(defaultControlledRightsForOrganizationType("pro")).toEqual(["composition", "performance"]);
+    expect(defaultControlledRightsForOrganizationType("cmo")).toEqual(["composition", "performance"]);
+    expect(defaultControlledRightsForOrganizationType("requester")).toEqual([]);
+  });
 });
 
 describe("requester organizations", () => {
@@ -54,6 +82,12 @@ describe("requester organizations", () => {
 });
 
 describe("organization policy defaults", () => {
+  it("treats the legacy recursive-training operation as AI scope", () => {
+    expect(isAiUsageKey("ai_training_recursive")).toBe(true);
+    expect(isAiUsageKey("ai_grounded_generation")).toBe(true);
+    expect(isAiUsageKey("derivative_remix")).toBe(false);
+  });
+
   it("routes nuanced AI uses to review without permitting open-weight models", () => {
     const defaults = createPolicyDefaults("review_each_ai_use");
     expect(defaults.usage.ai_grounded_generation).toBe("requires_approval");

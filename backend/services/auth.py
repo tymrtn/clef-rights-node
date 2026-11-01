@@ -1,50 +1,55 @@
 import datetime
+import re
 import secrets
 from typing import Tuple
 
 import jwt
-import requests
+
+from services.notifications import NotificationProvider
 
 
 class MagicLinkService:
-    def __init__(self, secret: str, link_exp_minutes: int, session_ttl_minutes: int, mailgun_api_key: str | None, mailgun_domain: str, base_url: str) -> None:
+    def __init__(self, secret: str, link_exp_minutes: int, session_ttl_minutes: int, notification_provider: NotificationProvider, base_url: str) -> None:
         self.secret = secret
         self.link_exp_minutes = link_exp_minutes
         self.session_ttl_minutes = session_ttl_minutes
-        self.mailgun_api_key = mailgun_api_key
-        self.mailgun_domain = mailgun_domain
+        self.notification_provider = notification_provider
         self.base_url = base_url.rstrip("/")
 
-    def create_and_send_link(self, email: str) -> str:
-        email = email.strip().lower()
-        if not ("@" in email and "." in email.split("@")[1]):
+    @staticmethod
+    def _email(value: object) -> str:
+        if not isinstance(value, str):
             raise ValueError("Valid email required")
+        email = value.strip().lower()
+        if not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", email):
+            raise ValueError("Valid email required")
+        return email
+
+    def create_and_send_link(self, email: str) -> str:
+        email = self._email(email)
         exp = datetime.datetime.utcnow() + datetime.timedelta(minutes=self.link_exp_minutes)
-        token = jwt.encode({"email": email, "exp": exp}, self.secret, algorithm="HS256")
+        # JWT dates have second precision; the nonce keeps simultaneous links distinct.
+        token = jwt.encode({"email": email, "exp": exp, "jti": secrets.token_urlsafe(24)}, self.secret, algorithm="HS256")
         link = f"{self.base_url}/login?token={token}"
-        if self.mailgun_api_key:
-            response = requests.post(
-                f"https://api.mailgun.net/v3/{self.mailgun_domain}/messages",
-                auth=("api", self.mailgun_api_key),
-                data={
-                    "from": f"Clef Rights <console@{self.mailgun_domain}>",
-                    "to": [email],
-                    "subject": "Your Clef Rights Console Link",
-                    "text": f"Your link (valid {self.link_exp_minutes} minutes): {link}"
-                },
-                timeout=15,
+        if self.notification_provider.enabled:
+            self.notification_provider.send(
+                to_emails=[email],
+                subject="Your Clef Rights Console Link",
+                text=f"Your link (valid {self.link_exp_minutes} minutes): {link}",
             )
-            response.raise_for_status()
         return link
 
     def validate_token(self, token: str) -> Tuple[bool, str]:
         try:
-            payload = jwt.decode(token, self.secret, algorithms=["HS256"])
-            return True, payload.get("email", "")
+            payload = jwt.decode(
+                token, self.secret, algorithms=["HS256"],
+                options={"require": ["exp", "email"]},
+            )
+            return True, self._email(payload["email"])
         except jwt.ExpiredSignatureError:
             return False, "Token expired"
-        except Exception as e:
-            return False, f"Invalid token: {str(e)}"
+        except (jwt.InvalidTokenError, ValueError, TypeError):
+            return False, "Invalid sign-in link"
 
     def create_session(self, email: str) -> dict:
         session_id = secrets.token_urlsafe(24)

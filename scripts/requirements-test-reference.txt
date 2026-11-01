@@ -1,0 +1,2 @@
+# Enables all synthetic catalog-reconciliation fixtures without download tooling.
+duckdb==1.5.5

@@ -177,3 +177,40 @@ export const RESTRICTION_CATEGORIES: Record<RestrictionCategory, CategoryMeta> =
 
 export const USAGE_KEYS = Object.keys(USAGE_CATEGORIES) as UsageCategory[]
 export const RESTRICTION_KEYS = Object.keys(RESTRICTION_CATEGORIES) as RestrictionCategory[]
+
+export type ReadinessState = 'ready' | 'warning' | 'disabled' | 'missing' | 'stale' | 'blocked'
+
+export interface NodeReadinessCheck {
+  key: string
+  status: ReadinessState
+  required: boolean
+  summary: string
+  remediation?: string
+  details: Record<string, unknown>
+}
+
+export interface NodeReadiness {
+  ready: boolean
+  deploymentMode: string
+  checkedAt: string
+  checks: NodeReadinessCheck[]
+}
+
+export type OnboardingState = 'complete' | 'in_progress' | 'pending' | 'not_applicable'
+
+export interface OrganizationOnboardingMilestone {
+  key: string
+  status: OnboardingState
+  summary: string
+  action?: string
+  count: number
+}
+
+export interface OrganizationOnboardingStatus {
+  organizationId: string
+  organizationType: string
+  complete: boolean
+  completedCount: number
+  applicableCount: number
+  milestones: OrganizationOnboardingMilestone[]
+}

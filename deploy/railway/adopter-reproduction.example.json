@@ -1,0 +1,99 @@
+{
+  "schemaVersion": "clef.adopter-reproduction.v1",
+  "operator": {
+    "identifier": "replace-with-reviewer-name-or-stable-private-id",
+    "role": "adopter",
+    "isClefFounder": false
+  },
+  "project": {
+    "provider": "railway",
+    "accountOwner": "replace-with-adopting-organization",
+    "projectId": "replace-with-project-id",
+    "createdAt": "2026-08-16T12:00:00Z"
+  },
+  "source": {
+    "revision": "replace-with-full-git-commit-hash",
+    "url": "https://github.com/owner/repository/tree/replace-with-full-git-commit-hash",
+    "exactRevisionVerified": false,
+    "publicReachabilityStatus": 0,
+    "archiveContentVerified": false,
+    "archiveSha256": ""
+  },
+  "custody": {
+    "clefHeldSecrets": false,
+    "secretValuesRecorded": false,
+    "generatedInAdopterProject": [
+      "RIGHTS_MAGIC_LINK_SECRET",
+      "NODE_SIGNING_PRIVATE_KEY_B64",
+      "WEBHOOK_ENCRYPTION_KEY_B64"
+    ],
+    "enteredAndSealedByAdopter": [
+      "SMTP_USERNAME",
+      "SMTP_PASSWORD"
+    ]
+  },
+  "services": [
+    {
+      "name": "Postgres",
+      "public": false,
+      "replicas": 1,
+      "status": "PENDING"
+    },
+    {
+      "name": "api",
+      "public": false,
+      "replicas": 1,
+      "status": "PENDING"
+    },
+    {
+      "name": "webhook-worker",
+      "public": false,
+      "replicas": 1,
+      "status": "PENDING"
+    },
+    {
+      "name": "expiry-worker",
+      "public": false,
+      "replicas": 1,
+      "status": "PENDING"
+    },
+    {
+      "name": "web",
+      "public": true,
+      "replicas": 1,
+      "status": "PENDING"
+    }
+  ],
+  "verification": {
+    "startedAt": "2026-08-16T12:00:00Z",
+    "finishedAt": "2026-08-16T12:00:00Z",
+    "elapsedMinutes": 0,
+    "deploymentVerifierPassed": false,
+    "releaseVerifierPassed": false,
+    "requiredReadinessStates": {
+      "database": "blocked",
+      "migrations": "blocked",
+      "signing_identity": "blocked",
+      "corresponding_source": "blocked",
+      "email_delivery": "blocked",
+      "webhook_worker": "blocked",
+      "expiry_worker": "blocked"
+    },
+    "magicLinkDelivery": {
+      "provider": "smtp",
+      "accepted": false,
+      "evidenceReference": ""
+    },
+    "browserAcceptance": {
+      "passed": false,
+      "evidenceReference": ""
+    },
+    "backupRestore": {
+      "performed": false,
+      "isolatedProjectId": "",
+      "verifierPassed": false,
+      "evidenceReference": ""
+    }
+  },
+  "failures": []
+}

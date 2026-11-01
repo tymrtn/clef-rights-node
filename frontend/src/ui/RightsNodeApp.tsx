@@ -1,5 +1,11 @@
 import React from "react";
 import { safeStorageGet, safeStorageRemove, safeStorageSet } from "../utils/storage";
+import { DeploymentReadinessPanel } from "./DeploymentReadinessPanel";
+import { OnboardingChecklist } from "./OnboardingChecklist";
+import { isPrivacyAdministrator, PrivacyPanel, privacyScopeKey } from "./PrivacyPanel";
+import { SandboxTour } from "./SandboxTour";
+import { ConnectedCatalogs } from "./ConnectedCatalogs";
+import { AuthorityWithdrawal } from "./AuthorityWithdrawal";
 
 const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
 const SESSION_KEY = "clef.rights.session";
@@ -7,6 +13,10 @@ const ORG_KEY = "clef.rights.organization";
 
 export function policyEditorScopeKey(organizationId: string): string {
   return `policy-editor:${organizationId}`;
+}
+
+export function organizationConsoleScopeKey(organizationId: string): string {
+  return `organization-console:${organizationId}`;
 }
 
 const STANDARD_USAGE_KEYS = [
@@ -41,13 +51,33 @@ const AI_USAGE_KEYS = [
   "ai_synthetic_voice",
 ] as const;
 
-const USAGE_KEYS = [...STANDARD_USAGE_KEYS, ...LEGACY_AI_USAGE_KEYS, ...AI_USAGE_KEYS] as const;
+const ALL_AI_USAGE_KEYS = [...AI_USAGE_KEYS, ...LEGACY_AI_USAGE_KEYS] as const;
+const USAGE_KEYS = [...STANDARD_USAGE_KEYS, ...ALL_AI_USAGE_KEYS] as const;
+
+export function isAiUsageKey(usage: string): boolean {
+  return (ALL_AI_USAGE_KEYS as readonly string[]).includes(usage);
+}
 
 const AI_INPUT_KEYS = ["full_mix", "stems", "isolated_vocals", "lyrics", "composition_data", "reference_embeddings"] as const;
 const AI_MODEL_SCOPE_KEYS = ["private_single_tenant", "shared_commercial_model", "public_or_open_weights"] as const;
 const AI_LIMIT_KEYS = ["maxSourceDurationSeconds", "maxOutputDurationSeconds", "maxLyricCharacters", "sourceRetentionDays", "embeddingRetentionDays"] as const;
 const AI_SAFEGUARD_KEYS = ["provenanceReceipt", "outputWatermark", "attribution", "similarityReview", "deletionAttestation"] as const;
 const RIGHT_TYPES = ["composition", "master", "lyrics", "performance", "voice", "likeness"] as const;
+const DEFAULT_CONTROLLED_RIGHTS_BY_ORGANIZATION_TYPE: Record<string, readonly string[]> = {
+  rights_holder: ["composition"],
+  artist: ["composition", "master", "lyrics", "performance", "voice", "likeness"],
+  label: ["master"],
+  publisher: ["composition", "lyrics"],
+  administrator: ["composition", "master"],
+  pro: ["composition", "performance"],
+  cmo: ["composition", "performance"],
+  collective: ["composition", "performance"],
+  requester: [],
+};
+
+export function defaultControlledRightsForOrganizationType(organizationType: string): string[] {
+  return [...(DEFAULT_CONTROLLED_RIGHTS_BY_ORGANIZATION_TYPE[organizationType] || DEFAULT_CONTROLLED_RIGHTS_BY_ORGANIZATION_TYPE.rights_holder)];
+}
 const API_CREDENTIAL_SCOPES = [
   "directory:read",
   "registry:read",
@@ -70,6 +100,7 @@ const API_CREDENTIAL_SCOPES = [
   "webhooks:write",
   "audit:read",
 ] as const;
+const ORG_DECISION_ROLES = new Set(["owner", "admin", "rights_manager"]);
 
 const LABELS: Record<string, string> = {
   ai_training_recursive: "Legacy recursive AI training",
@@ -120,6 +151,7 @@ const RESTRICTION_KEYS = [
 
 type SessionCredential = { id: string; email: string; expires_at: string };
 type NodeInfo = {
+  federationEnabled?: boolean;
   deploymentMode: string;
   sandboxGuestAccess: boolean;
   webhookDeliveryEnabled: boolean;
@@ -370,6 +402,7 @@ type CatalogImportBatch = {
   rows: CatalogImportRow[];
   createdAt: string;
   committedAt?: string;
+  previewDigest: string;
 };
 type ReceiptInspection = {
   receipt: Record<string, any>;
@@ -462,6 +495,17 @@ async function api<T>(path: string, session?: SessionCredential, init: RequestIn
   return response.json() as Promise<T>;
 }
 
+export async function downloadPrivateReceipt(receiptId: string, session: SessionCredential): Promise<void> {
+  const receipt = await api<Record<string, unknown>>(`/v1/receipts/${encodeURIComponent(receiptId)}`, session);
+  const url = URL.createObjectURL(new Blob([JSON.stringify(receipt, null, 2)], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `clef-receipt-${receiptId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
+  document.body.append(link);
+  try { link.click(); }
+  finally { link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
+}
+
 function readSession(): SessionCredential | null {
   try {
     const value = safeStorageGet("session", SESSION_KEY);
@@ -547,8 +591,8 @@ function DeploymentBanner({ nodeInfo }: { nodeInfo: NodeInfo | null }) {
   return (
     <aside className="border-b border-amber-300 bg-amber-50 px-6 py-3 text-sm text-amber-950" role="status">
       <div className="mx-auto max-w-7xl">
-        <strong>Public synthetic sandbox — not production.</strong>{" "}
-        Records may be reset without notice. Do not enter real catalog, contract, personal, or confidential data. Live MLC, DDEX, payment, partner delivery, and model services are disabled.{" "}
+        <strong>Public sandbox · fictional examples.</strong>{" "}
+        Explore with fictional names, identifiers and terms. Sessions expire and records may be reset. Registry, payment and model connections are isolated for this demonstration.{" "}
         {nodeInfo?.sourceCodeUrl ? <a className="font-medium underline" href={nodeInfo.sourceCodeUrl} rel="noreferrer" target="_blank">Inspect source revision {nodeInfo.sourceCodeRevision}</a> : <>Running source revision {nodeInfo?.sourceCodeRevision || "unknown"}.</>}
       </div>
     </aside>
@@ -619,21 +663,21 @@ function SignIn({ onAuthenticated, nodeInfo }: { onAuthenticated: (credential: S
     <DeploymentBanner nodeInfo={nodeInfo} />
     <main className="mx-auto grid min-h-[calc(100vh-5rem)] max-w-6xl items-center gap-12 px-6 py-12 lg:grid-cols-2">
       <div>
-        <Badge tone="blue">Catalog controls for AI and beyond</Badge>
-        <h1 className="mt-5 text-5xl font-semibold tracking-tight text-slate-950">Make your organization ready for the AI licensing era.</h1>
+        <Badge tone="blue">Clef Rights Node</Badge>
+        <h1 className="mt-5 text-5xl font-semibold tracking-tight text-slate-950">Catalog controls for the AI licensing era.</h1>
         <p className="mt-5 max-w-xl text-lg leading-8 text-slate-600">
           Labels, publishers, PROs, CMOs, collectives, and rights administrators can manage represented catalogs, route licensing decisions, track provenance, and account for royalties.
         </p>
         <div className="mt-8 grid gap-3 text-sm text-slate-700 sm:grid-cols-3">
-          <div className="rounded-xl border border-slate-200 bg-white p-4"><strong>Administrators:</strong> deploy for represented creators and route exceptions to named reviewers.</div>
-          <div className="rounded-xl border border-slate-200 bg-white p-4"><strong>Requesters:</strong> each receipt covers only its declared scope.</div>
-          <div className="rounded-xl border border-slate-200 bg-white p-4"><strong>Node operators:</strong> verify authority evidence without manufacturing rights.</div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4"><strong>Your catalog:</strong> connect recordings, compositions and the rights you administer.</div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4"><strong>Your artists:</strong> keep their conditions attached to each AI-use request.</div>
+          <div className="rounded-xl border border-slate-200 bg-white p-4"><strong>Your decisions:</strong> assign reviewers and carry the agreed terms into a signed receipt.</div>
         </div>
       </div>
       {nodeInfo?.sandboxGuestAccess ? <section className="rounded-3xl border border-amber-200 bg-white p-8 shadow-xl shadow-slate-200/50">
-        <h2 className="text-2xl font-semibold text-slate-950">Enter the synthetic sandbox</h2>
-        <p className="mt-2 text-sm leading-6 text-slate-600">Start a short-lived anonymous session. Use fictional names and identifiers only; the records are not authority, permission, payment, or legal evidence and may be reset without notice.</p>
-        <button type="button" disabled={busy} onClick={() => void enterSandbox()} className="mt-6 w-full rounded-xl bg-slate-950 px-4 py-3 font-medium text-white hover:bg-slate-800 disabled:opacity-50">{busy ? "Starting…" : "Enter without an account"}</button>
+        <h2 className="text-2xl font-semibold text-slate-950">Take a catalog from request to approval.</h2>
+        <p className="mt-2 text-sm leading-6 text-slate-600">Explore a fictional label and publisher, review an AI-use request and verify the signed decision. Your anonymous session comes with a prepared catalog; you can also try the full setup flow.</p>
+        <button type="button" disabled={busy} onClick={() => void enterSandbox()} className="mt-6 w-full rounded-xl bg-slate-950 px-4 py-3 font-medium text-white hover:bg-slate-800 disabled:opacity-50">{busy ? "Starting…" : "Explore the example catalog"}</button>
         {status && <p className="mt-4 text-sm text-slate-600" role="status">{status}</p>}
       </section> : <form onSubmit={requestLink} className="rounded-3xl border border-slate-200 bg-white p-8 shadow-xl shadow-slate-200/50">
         <h2 className="text-2xl font-semibold text-slate-950">Sign in to your node</h2>
@@ -656,7 +700,7 @@ function OrganizationSetup({ session, onCreated }: { session: SessionCredential;
   const [slug, setSlug] = React.useState("");
   const [organizationType, setOrganizationType] = React.useState("rights_holder");
   const [territory, setTerritory] = React.useState("worldwide");
-  const [controlledRights, setControlledRights] = React.useState<string[]>(["composition"]);
+  const [controlledRights, setControlledRights] = React.useState<string[]>(() => defaultControlledRightsForOrganizationType("rights_holder"));
   const [aiPreset, setAiPreset] = React.useState<"review_each_ai_use" | "block_all_ai">("review_each_ai_use");
   const [error, setError] = React.useState("");
   const isRequester = organizationType === "requester";
@@ -706,7 +750,7 @@ function OrganizationSetup({ session, onCreated }: { session: SessionCredential;
             <label className="block text-sm font-medium text-slate-800">Node slug<input required value={slug} onChange={(event) => setSlug(event.target.value.toLowerCase())} className="mt-2 w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="organization-slug" pattern="[a-z0-9_-]+" /></label>
           </>}
           {step === 2 && <>
-            <label className="block text-sm font-medium text-slate-800">Organization type<select value={organizationType} onChange={(event) => { const value = event.target.value; setOrganizationType(value); if (value === "requester") setControlledRights([]); else if (controlledRights.length === 0) setControlledRights(["composition"]); }} className="mt-2 w-full rounded-xl border border-slate-300 px-4 py-3">{[["rights_holder", "Rights holder"], ["artist", "Artist"], ["label", "Label"], ["publisher", "Publisher"], ["administrator", "Rights administrator"], ["pro", "Performing rights organization (PRO)"], ["cmo", "Collective management organization (CMO)"], ["collective", "Rights collective"], ["requester", "Requester / producer"]].map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <label className="block text-sm font-medium text-slate-800">Organization type<select value={organizationType} onChange={(event) => { const value = event.target.value; setOrganizationType(value); setControlledRights(defaultControlledRightsForOrganizationType(value)); }} className="mt-2 w-full rounded-xl border border-slate-300 px-4 py-3">{[["rights_holder", "Rights holder"], ["artist", "Artist"], ["label", "Label"], ["publisher", "Publisher"], ["administrator", "Rights administrator"], ["pro", "Performing rights organization (PRO)"], ["cmo", "Collective management organization (CMO)"], ["collective", "Rights collective"], ["requester", "Requester / producer"]].map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><span className="mt-2 block text-xs font-normal text-slate-500">Selecting a type applies suggested rights. Review them before continuing; the selection never proves authority.</span></label>
             <label className="block text-sm font-medium text-slate-800">Default territory<input required value={territory} onChange={(event) => setTerritory(event.target.value)} className="mt-2 w-full rounded-xl border border-slate-300 px-4 py-3" placeholder="worldwide, US, CA, or another declared territory" /></label>
             {isRequester ? <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm text-slate-700"><strong>No rights claim is created.</strong><p className="mt-1">This organization can request permission and inspect its receipts. It cannot publish or approve authority without later joining a rights-holding organization.</p></div> : <fieldset><legend className="mb-2 text-sm font-medium text-slate-800">Rights this organization expects to administer</legend><div className="grid gap-2 sm:grid-cols-3">{RIGHT_TYPES.map((right) => <label key={right} className="flex items-center gap-2 rounded-xl border border-slate-200 p-3 text-sm"><input type="checkbox" checked={controlledRights.includes(right)} onChange={() => toggleRight(right)} />{humanize(right)}</label>)}</div><p className="mt-2 text-xs text-slate-500">Each authority claim still requires evidence and operator review.</p></fieldset>}
           </>}
@@ -739,10 +783,10 @@ function MlcCatalogSearch({ session, organization, onSelect }: { session: Sessio
     try {
       const response = await api<{ results: Record<string, any>[] }>(`/v1/organizations/${organization.id}/catalog/mlc/search/works`, session, { method: "POST", body: JSON.stringify({ title: title || null, writer_lastname: writer || null }) });
       setResults(response.results);
-      if (response.results.length === 0) setMessage("No MLC works matched this search.");
-    } catch (error) { setMessage(error instanceof Error ? error.message : "MLC search failed."); }
+      if (response.results.length === 0) setMessage("No works matched this search in The MLC.");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "The MLC search failed."); }
   }
-  return <details className="rounded-xl border border-slate-200 bg-slate-50 p-4"><summary className="cursor-pointer font-medium text-slate-900">Find a musical work in MLC</summary>{authorized ? <div className="mt-4 space-y-3"><form onSubmit={search} className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]"><input value={title} onChange={(event) => setTitle(event.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2" placeholder="Work title" /><input value={writer} onChange={(event) => setWriter(event.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2" placeholder="Writer last name" /><button disabled={!title && !writer} className="rounded-lg bg-slate-900 px-4 py-2 font-medium text-white disabled:opacity-40">Search MLC</button></form><p className="text-xs text-slate-500">Search results are observed registry metadata. Selecting one does not prove authority.</p><div className="space-y-2">{results.map((result, index) => { const selection = catalogSelectionFromMlcResult(result); const workTitle = selection?.workTitle || String(result.workTitle || result.title || "Untitled work"); const songCode = selection?.workKey.replace(/^mlc:/, "") || ""; const artist = selection?.artistName || String(result.artist || result.primaryArtist || ""); return <div key={`${songCode || workTitle}-${index}`} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white p-3"><div><strong>{workTitle}</strong><p className="text-xs text-slate-600">{artist || "Artist not supplied"} · {songCode || "No durable MLC song code returned"}</p></div><button type="button" disabled={!selection} onClick={() => selection && onSelect(selection)} className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-medium text-blue-800 disabled:opacity-40">Use this work</button></div>; })}</div></div> : <p className="mt-3 text-sm text-slate-600">MLC catalog lookup is disabled. Add the operator-managed MLC credentials and `catalog_lookup` capability, or enter a durable identifier manually below.</p>}{message && <p className="mt-3 text-sm text-slate-600">{message}</p>}</details>;
+  return <details className="rounded-xl border border-slate-200 bg-slate-50 p-4"><summary className="cursor-pointer font-medium text-slate-900">Find a musical work in The MLC</summary>{authorized ? <div className="mt-4 space-y-3"><form onSubmit={search} className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]"><input value={title} onChange={(event) => setTitle(event.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2" placeholder="Work title" /><input value={writer} onChange={(event) => setWriter(event.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2" placeholder="Writer last name" /><button disabled={!title && !writer} className="rounded-lg bg-slate-900 px-4 py-2 font-medium text-white disabled:opacity-40">Search The MLC</button></form><p className="text-xs text-slate-500">The MLC supplies work references and publishing claims in a U.S. administrative context. DSP-supplied recording metadata is processed as received. Your organization supplies master ownership, controlled-share and territorial authority evidence for each decision.</p><div className="space-y-2">{results.map((result, index) => { const selection = catalogSelectionFromMlcResult(result); const workTitle = selection?.workTitle || String(result.workTitle || result.title || "Untitled work"); const songCode = selection?.workKey.replace(/^mlc:/, "") || ""; const artist = selection?.artistName || String(result.artist || result.primaryArtist || ""); return <div key={`${songCode || workTitle}-${index}`} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white p-3"><div><strong>{workTitle}</strong><p className="text-xs text-slate-600">{artist || "Artist not supplied"} · {songCode || "No durable song code returned by The MLC"}</p></div><button type="button" disabled={!selection} onClick={() => selection && onSelect(selection)} className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-medium text-blue-800 disabled:opacity-40">Use this work</button></div>; })}</div></div> : <p className="mt-3 text-sm text-slate-600">The MLC catalog lookup is disabled. Add the operator-managed credentials for The MLC and `catalog_lookup` capability, or enter a durable identifier manually below.</p>}{message && <p className="mt-3 text-sm text-slate-600">{message}</p>}</details>;
 }
 
 function Policies({ session, organization }: { session: SessionCredential; organization: Organization }) {
@@ -816,8 +860,8 @@ function Policies({ session, organization }: { session: SessionCredential; organ
   return (
     <div className="grid gap-6 xl:grid-cols-[1.25fr_.75fr]">
       <Panel title={version ? `Edit policy v${version}` : "Publish a rights policy"} description="Declare every use and restriction. Omitted categories are blocked, and each publication creates an immutable version.">
-        <form onSubmit={save} className="space-y-6">
           {!version && <MlcCatalogSearch session={session} organization={organization} onSelect={(selection) => { setWorkKey(selection.workKey); setWorkTitle(selection.workTitle); if (selection.artistName) setArtistName(selection.artistName); }} />}
+        <form onSubmit={save} className="mt-6 space-y-6">
           {!version && catalogAssets.length > 0 && <label className="block text-sm font-medium text-slate-800">Start from the managed catalog<select value="" onChange={(event) => { const asset = catalogAssets.find((item) => item.id === event.target.value); if (asset) { setWorkKey(asset.workKey); setWorkTitle(asset.title); setArtistName(asset.artist || ""); } }} className="mt-2 w-full rounded-xl border border-slate-300 bg-white px-3 py-2"><option value="">Choose a catalog work or enter one below</option>{catalogAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.title} — {asset.artist || "Artist not supplied"} ({asset.workKey}; v{asset.version})</option>)}</select><span className="mt-1 block text-xs font-normal text-slate-500">Catalog selection fills metadata only. Publishing a policy still does not prove authority.</span></label>}
           <div className="grid gap-3 sm:grid-cols-3">
             <input required disabled={version > 0} value={workKey} onChange={(event) => setWorkKey(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2 disabled:bg-slate-100" placeholder="Work key (e.g. mlc:12345)" />
@@ -826,6 +870,8 @@ function Policies({ session, organization }: { session: SessionCredential; organ
           </div>
           <Matrix title="Non-AI uses covered by this policy" keys={STANDARD_USAGE_KEYS} values={usage} options={["blocked", "requires_approval", "allowed"]} onChange={setUsage} />
           <Matrix title="AI operations" keys={AI_USAGE_KEYS} values={usage} options={["blocked", "requires_approval", "allowed"]} onChange={setUsage} />
+          <Matrix title="Legacy AI compatibility" keys={LEGACY_AI_USAGE_KEYS} values={usage} options={["blocked", "requires_approval", "allowed"]} onChange={setUsage} />
+          <p className="-mt-4 text-xs leading-5 text-slate-500">Legacy recursive training remains explicit for older integrations. It is still an AI operation and requires the same scoped request and safeguards.</p>
           <AiPolicyEditor value={aiPolicy} onChange={setAiPolicy} />
           <Matrix title="Context restrictions" keys={RESTRICTION_KEYS} values={restrictions} options={["allowed", "conditional", "denied"]} onChange={setRestrictions} />
           <div className="flex gap-3"><button className="rounded-xl bg-blue-700 px-5 py-2.5 font-medium text-white">{version ? "Publish next version" : "Publish policy"}</button>{version > 0 && <button type="button" onClick={reset} className="rounded-xl border border-slate-300 px-5 py-2.5">Cancel</button>}</div>
@@ -852,7 +898,7 @@ function AiPolicyEditor({ value, onChange }: { value: AiPolicy; onChange: React.
   return <section className="space-y-5 rounded-2xl border border-blue-200 bg-blue-50/40 p-4"><div><h3 className="font-medium text-slate-950">AI license scope</h3><p className="mt-1 text-sm text-slate-600">Operation permission is only the first gate. Declare which source materials, model environments, limits, and controls a license may cover.</p></div><Matrix title="Source materials supplied to the AI system" keys={AI_INPUT_KEYS} values={value.inputs} options={["blocked", "requires_approval", "allowed"]} onChange={setInputs} /><Matrix title="Model environment" keys={AI_MODEL_SCOPE_KEYS} values={value.modelScopes} options={["blocked", "requires_approval", "allowed"]} onChange={setScopes} /><fieldset><legend className="font-medium text-slate-900">Numerical license limits</legend><p className="mt-1 text-xs text-slate-500">A blank value means the limit must be settled in the individual license. It never means unlimited.</p><div className="mt-3 grid gap-3 sm:grid-cols-2">{AI_LIMIT_KEYS.map((key) => <label key={key} className="text-sm text-slate-700">{humanize(key)}<input type="number" min="0" value={value.limits[key] ?? ""} onChange={(event) => onChange((current) => ({ ...current, limits: { ...current.limits, [key]: event.target.value === "" ? null : Number(event.target.value) } }))} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2" placeholder="Set per license" /></label>)}</div></fieldset><fieldset><legend className="font-medium text-slate-900">Controls required in every approved AI license</legend><div className="mt-3 grid gap-2 sm:grid-cols-2">{AI_SAFEGUARD_KEYS.map((key) => <label key={key} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"><input type="checkbox" checked={value.safeguards[key]} onChange={(event) => onChange((current) => ({ ...current, safeguards: { ...current.safeguards, [key]: event.target.checked } }))} />{humanize(key)}</label>)}</div></fieldset></section>;
 }
 
-function Catalog({ session, organization }: { session: SessionCredential; organization: Organization }) {
+export function Catalog({ session, organization }: { session: SessionCredential; organization: Organization }) {
   const [clients, setClients] = React.useState<CatalogClient[]>([]);
   const [assets, setAssets] = React.useState<CatalogAsset[]>([]);
   const [imports, setImports] = React.useState<CatalogImportBatch[]>([]);
@@ -867,6 +913,15 @@ function Catalog({ session, organization }: { session: SessionCredential; organi
   const [assignmentReasons, setAssignmentReasons] = React.useState<Record<string, string>>({});
   const [message, setMessage] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const busyRef = React.useRef(false);
+  const batchSequence = React.useRef(0);
+  React.useEffect(() => () => { batchSequence.current += 1; }, [organization.id, session.id]);
+  function startWrite() {
+    if (busyRef.current) return false;
+    busyRef.current = true; batchSequence.current += 1; setBusy(true); setMessage(""); return true;
+  }
+  function endWrite() { busyRef.current = false; setBusy(false); }
+
 
   const load = React.useCallback(async () => {
     const [clientResponse, assetResponse, importResponse] = await Promise.all([
@@ -880,22 +935,23 @@ function Catalog({ session, organization }: { session: SessionCredential; organi
   }, [organization.id, session]);
 
   const loadBatch = React.useCallback(async (batchId: string) => {
+    const current = ++batchSequence.current;
     const response = await api<CatalogImportBatch>(`/v1/organizations/${organization.id}/catalog/imports/${batchId}`, session);
-    setBatch(response);
-    setConfirmImport(false);
+    if (current !== batchSequence.current) return;
+    setBatch(response); setResolutionNotes({}); setConfirmImport(false);
   }, [organization.id, session]);
 
   React.useEffect(() => void load().catch((error) => setMessage(error.message)), [load]);
 
   async function createClient(event: React.FormEvent) {
     event.preventDefault();
-    setBusy(true); setMessage("");
+    if (!startWrite()) return;
     try {
       await api(`/v1/organizations/${organization.id}/catalog/clients`, session, { method: "POST", body: JSON.stringify({ name: clientName, external_reference: clientReference, contact_email: clientEmail || null }) });
       setClientName(""); setClientReference(""); setClientEmail(""); setMessage("Managed client created. Its reference can now be used in CSV imports.");
       await load();
     } catch (error) { setMessage(error instanceof Error ? error.message : "Could not create the managed client."); }
-    finally { setBusy(false); }
+    finally { endWrite(); }
   }
 
   async function downloadTemplate() {
@@ -913,60 +969,85 @@ function Catalog({ session, organization }: { session: SessionCredential; organi
   async function previewImport(event: React.FormEvent) {
     event.preventDefault();
     if (!file) return;
-    setBusy(true); setMessage("");
+    if (!startWrite()) return;
     try {
       const body = new FormData(); body.append("file", file);
       const response = await api<CatalogImportBatch>(`/v1/organizations/${organization.id}/catalog/imports/csv`, session, { method: "POST", body });
       setBatch(response); setConfirmImport(false); setMessage(response.status === "committed" ? "This exact file was already committed; no duplicate records were created." : "Preview created. Review every flagged row before committing.");
       await load();
     } catch (error) { setMessage(error instanceof Error ? error.message : "Could not preview the catalog."); }
-    finally { setBusy(false); }
+    finally { endWrite(); }
   }
 
   async function resolve(row: CatalogImportRow, resolution: "skip" | "new_version") {
     if (!batch) return;
     const note = (resolutionNotes[row.id] || "").trim();
     if (!note) return;
-    setBusy(true); setMessage("");
+    if (!startWrite()) return;
     try {
-      await api(`/v1/organizations/${organization.id}/catalog/imports/${batch.id}/rows/${row.id}/resolution`, session, { method: "POST", body: JSON.stringify({ resolution, note }) });
+      await api(`/v1/organizations/${organization.id}/catalog/imports/${batch.id}/rows/${row.id}/resolution`, session, { method: "POST", body: JSON.stringify({ resolution, note, expected_preview_digest: batch.previewDigest }) });
       await loadBatch(batch.id);
       setMessage(resolution === "skip" ? `Row ${row.rowNumber} will be skipped.` : `Row ${row.rowNumber} will become a new immutable catalog version.`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Could not resolve the conflict."); }
-    finally { setBusy(false); }
+    finally { endWrite(); }
+  }
+
+  async function refreshImport() {
+    if (!batch || !startWrite()) return;
+    try {
+      const response = await api<CatalogImportBatch>(`/v1/organizations/${organization.id}/catalog/imports/${batch.id}/refresh`, session,
+        { method: "POST", body: JSON.stringify({ expected_preview_digest: batch.previewDigest }) });
+      setBatch(response); setConfirmImport(false); setResolutionNotes({});
+      setMessage("Preview refreshed against the current catalog and client list. Review flagged rows and confirm the import again.");
+      await load();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Could not refresh this preview."); }
+    finally { endWrite(); }
   }
 
   async function commitImport() {
     if (!batch || !confirmImport) return;
-    setBusy(true); setMessage("");
+    if (!startWrite()) return;
     try {
-      const response = await api<CatalogImportBatch>(`/v1/organizations/${organization.id}/catalog/imports/${batch.id}/commit`, session, { method: "POST", body: JSON.stringify({ confirm_import: true }) });
+      const response = await api<CatalogImportBatch>(`/v1/organizations/${organization.id}/catalog/imports/${batch.id}/commit`, session, { method: "POST", body: JSON.stringify({ confirm_import: true, expected_preview_digest: batch.previewDigest }) });
       setBatch(response); setConfirmImport(false); setMessage(`${response.summary.counts.imported || 0} catalog records committed. Catalog metadata remains separate from authority evidence.`);
       await load();
     } catch (error) { setMessage(error instanceof Error ? error.message : "Could not commit the catalog."); }
-    finally { setBusy(false); }
+    finally { endWrite(); }
   }
 
   async function assign(asset: CatalogAsset) {
     const reason = (assignmentReasons[asset.id] || "").trim();
     if (!reason) return;
-    setBusy(true); setMessage("");
+    if (!startWrite()) return;
     try {
-      await api(`/v1/organizations/${organization.id}/catalog/assets/${asset.id}/assignment`, session, { method: "POST", body: JSON.stringify({ client_id: assignmentClients[asset.id] || null, reason }) });
+      const selectedClient = assignmentClients[asset.id] ?? asset.client?.id ?? "";
+      await api(`/v1/organizations/${organization.id}/catalog/assets/${asset.id}/assignment`, session, { method: "POST", body: JSON.stringify({ client_id: selectedClient || null, reason }) });
       setAssignmentReasons((current) => ({ ...current, [asset.id]: "" })); setMessage(`Assignment history appended for ${asset.title}.`); await load();
     } catch (error) { setMessage(error instanceof Error ? error.message : "Could not change the client assignment."); }
-    finally { setBusy(false); }
+    finally { endWrite(); }
   }
 
   return <div className="space-y-6">
-    <section className="rounded-2xl border border-blue-200 bg-blue-50 p-5 text-sm text-slate-700"><strong className="text-slate-950">Catalog intake records what the label supplied; it does not prove control.</strong><p className="mt-1">After import, publish a policy and submit separate authority evidence for each right and territory. Only a verified authority claim can approve permission.</p></section>
+    <section className="rounded-2xl border border-blue-200 bg-blue-50 p-5 text-sm text-slate-700"><strong className="text-slate-950">Bring your catalog and the evidence behind its rights into one workflow.</strong><p className="mt-1">Import identifiers and metadata, publish the creator’s conditions, and submit the mandate for each right and territory. Verified authority enables scoped approvals.</p></section>
     <div className="grid gap-6 xl:grid-cols-2">
-      <Panel title="1. Create managed clients" description="Use a stable reference from your own royalty or contract system. References are stored lowercase and CSV matching is case-insensitive; artist display names are never used as identifiers."><form onSubmit={createClient} className="grid gap-3 sm:grid-cols-2"><input required value={clientName} onChange={(event) => setClientName(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" placeholder="Client or artist name" /><input required value={clientReference} onChange={(event) => setClientReference(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" placeholder="Stable client reference" /><input type="email" value={clientEmail} onChange={(event) => setClientEmail(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2 sm:col-span-2" placeholder="Client contact email (optional)" /><button disabled={busy} className="rounded-xl bg-slate-950 px-4 py-2.5 font-medium text-white sm:col-span-2 disabled:opacity-40">Create managed client</button></form><div className="mt-4 space-y-2">{clients.length === 0 && <p className="text-sm text-slate-500">No managed clients yet. Create these before importing rows that use client_reference.</p>}{clients.map((client) => <div key={client.id} className="flex items-center justify-between rounded-lg border border-slate-200 p-3 text-sm"><div><strong>{client.name}</strong><p className="text-xs text-slate-500">{client.externalReference}{client.contactEmail ? ` · ${client.contactEmail}` : ""}</p></div><Badge>managed client</Badge></div>)}</div></Panel>
-      <Panel title="2. Preview a catalog CSV" description="The preview validates durable identifiers, client references, duplicate rows, and conflicts. Nothing enters the catalog until you confirm the commit."><div className="flex flex-wrap gap-2"><button type="button" onClick={downloadTemplate} className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-medium text-blue-800">Download CSV template</button><Badge tone="blue">10,000 rows maximum</Badge><Badge>10 MB maximum</Badge></div><form onSubmit={previewImport} className="mt-4 space-y-3"><input aria-label="Catalog CSV" type="file" accept=".csv,text/csv" required onChange={(event) => setFile(event.target.files?.[0] || null)} className="block w-full rounded-xl border border-slate-300 bg-white p-3 text-sm" /><button disabled={!file || busy} className="rounded-xl bg-blue-700 px-4 py-2.5 font-medium text-white disabled:opacity-40">Upload and preview</button></form><div className="mt-5"><h3 className="text-sm font-medium text-slate-900">Recent imports</h3><div className="mt-2 space-y-2">{imports.length === 0 && <p className="text-sm text-slate-500">No catalog files have been staged.</p>}{imports.slice(0, 5).map((item) => <button key={item.id} onClick={() => void loadBatch(item.id)} className="flex w-full items-center justify-between rounded-lg border border-slate-200 p-3 text-left text-sm"><span><strong>{item.filename}</strong><span className="ml-2 text-xs text-slate-500">{item.summary.total} rows</span></span><Badge tone={item.status === "committed" ? "green" : item.summary.unresolved ? "amber" : "blue"}>{item.status}</Badge></button>)}</div></div></Panel>
+      <Panel title="1. Create managed clients" description="Use a stable client reference from your royalty or contract system to connect imported records with the right artist or songwriter. References are stored lowercase and matched without case.">
+        <form onSubmit={createClient} className="grid gap-3 sm:grid-cols-2">
+          <label className="text-sm font-medium text-slate-800">Client or artist name
+            <input required value={clientName} onChange={(event) => setClientName(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 font-normal" placeholder="For example: Mara Vale" />
+          </label>
+          <label className="text-sm font-medium text-slate-800">Client reference
+            <input required value={clientReference} onChange={(event) => setClientReference(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 font-normal" placeholder="For example: artist-0042" />
+          </label>
+          <label className="text-sm font-medium text-slate-800 sm:col-span-2">Client contact email (optional)
+            <input type="email" value={clientEmail} onChange={(event) => setClientEmail(event.target.value)} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 font-normal" placeholder="artist@example.com" />
+          </label>
+          <button disabled={busy} className="rounded-xl bg-slate-950 px-4 py-2.5 font-medium text-white sm:col-span-2 disabled:opacity-40">Create managed client</button>
+        </form><div className="mt-4 space-y-2">{clients.length === 0 && <p className="text-sm text-slate-500">No managed clients yet. Create these before importing rows that use client_reference.</p>}{clients.map((client) => <div key={client.id} className="flex items-center justify-between rounded-lg border border-slate-200 p-3 text-sm"><div><strong>{client.name}</strong><p className="text-xs text-slate-500">{client.externalReference}{client.contactEmail ? ` · ${client.contactEmail}` : ""}</p></div><Badge>managed client</Badge></div>)}</div></Panel>
+      <Panel title="2. Preview a catalog CSV" description="The preview checks identifiers, client references, duplicate rows and conflicts. Review the results, then confirm which records to add."><div className="flex flex-wrap gap-2"><button type="button" onClick={downloadTemplate} className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-medium text-blue-800">Download CSV template</button><Badge tone="blue">10,000 rows maximum</Badge><Badge>10 MB maximum</Badge></div><form onSubmit={previewImport} className="mt-4 space-y-3"><input aria-label="Catalog CSV" type="file" accept=".csv,text/csv" required onChange={(event) => setFile(event.target.files?.[0] || null)} className="block w-full rounded-xl border border-slate-300 bg-white p-3 text-sm" /><button disabled={!file || busy} className="rounded-xl bg-blue-700 px-4 py-2.5 font-medium text-white disabled:opacity-40">Upload and preview</button></form><div className="mt-5"><h3 className="text-sm font-medium text-slate-900">Recent imports</h3><div className="mt-2 space-y-2">{imports.length === 0 && <p className="text-sm text-slate-500">No catalog files have been staged.</p>}{imports.slice(0, 5).map((item) => <button key={item.id} disabled={busy} onClick={() => void loadBatch(item.id).catch(error => setMessage(error.message))} className="flex w-full items-center justify-between rounded-lg border border-slate-200 p-3 text-left text-sm"><span><strong>{item.filename}</strong><span className="ml-2 text-xs text-slate-500">{item.summary.total} rows</span></span><Badge tone={item.status === "committed" ? "green" : item.summary.unresolved ? "amber" : "blue"}>{item.status}</Badge></button>)}</div></div></Panel>
     </div>
     {!batch && <Panel title="3. Review and commit" description="After upload, inspect every row here. Invalid rows must be corrected; catalog conflicts require a written skip or immutable-version decision before commit."><p className="text-sm text-slate-500">No preview selected. Upload a CSV above or reopen a recent import.</p></Panel>}
-    {batch && <Panel title={`3. Review ${batch.filename}`} description={`SHA-256 ${batch.fileSha256}. Exact-file replays return this batch instead of creating duplicates.`}><div className="flex flex-wrap gap-2"><Badge tone={batch.status === "committed" ? "green" : "blue"}>{batch.status}</Badge><Badge>{batch.summary.total} rows</Badge><Badge tone={batch.summary.unresolved ? "amber" : "green"}>{batch.summary.unresolved} unresolved</Badge><Badge tone="blue">{batch.summary.importable} importable</Badge><Badge>{batch.summary.skipped} skipped</Badge></div><div className="mt-4 space-y-3">{batch.rows.map((row) => <article key={row.id} className={`rounded-xl border p-4 ${row.status === "invalid" || row.status === "conflict" ? "border-amber-300 bg-amber-50/40" : "border-slate-200"}`}><div className="flex flex-wrap items-start justify-between gap-2"><div><strong>Row {row.rowNumber} · {row.normalized.title || "Untitled"}</strong><p className="mt-1 break-all text-xs text-slate-500">{row.normalized.work_key || "No durable identifier"} · {row.normalized.client_reference || "unassigned"}</p></div><Badge tone={row.status === "imported" ? "green" : row.status === "conflict" || row.status === "invalid" ? "amber" : row.status.startsWith("resolved") ? "blue" : "gray"}>{humanize(row.status)}</Badge></div>{row.errors.length > 0 && <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-amber-900">{row.errors.map((error) => <li key={error}>{error}</li>)}</ul>}{row.existingAsset && <p className="mt-3 text-sm text-slate-600">Existing v{row.existingAsset.version}: {row.existingAsset.title} · {row.existingAsset.artist || "Artist not supplied"} · source {row.existingAsset.sourceReference || "not supplied"}</p>}{row.status === "conflict" && <div className="mt-3 space-y-2"><textarea aria-label={`Resolution note for row ${row.rowNumber}`} value={resolutionNotes[row.id] || ""} onChange={(event) => setResolutionNotes((current) => ({ ...current, [row.id]: event.target.value }))} className="min-h-20 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="Record the evidence for skipping this row or creating a corrected version." /><div className="flex flex-wrap gap-2"><button disabled={busy || !(resolutionNotes[row.id] || "").trim()} onClick={() => void resolve(row, "new_version")} className="rounded-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Create immutable next version</button><button disabled={busy || !(resolutionNotes[row.id] || "").trim()} onClick={() => void resolve(row, "skip")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium disabled:opacity-40">Skip this row</button></div></div>}{row.resolutionNote && <p className="mt-2 text-xs text-slate-500">Resolution: {row.resolutionNote}</p>}</article>)}</div>{batch.status === "preview" && <div className="mt-5 rounded-xl border border-slate-300 bg-slate-50 p-4"><label className="flex items-start gap-3 text-sm"><input type="checkbox" checked={confirmImport} onChange={(event) => setConfirmImport(event.target.checked)} className="mt-1" /><span><strong>Commit these catalog records as immutable versions.</strong><span className="mt-1 block text-slate-600">I reviewed the preview and understand this imports metadata only; it creates no ownership or licensing authority.</span></span></label><button disabled={busy || !confirmImport || batch.summary.unresolved > 0} onClick={() => void commitImport()} className="mt-4 rounded-xl bg-emerald-700 px-5 py-2.5 font-medium text-white disabled:opacity-40">Commit catalog</button>{batch.summary.unresolved > 0 && <p className="mt-2 text-xs text-amber-800">Correct invalid rows in the source file and upload again; resolve existing-catalog conflicts above.</p>}</div>}</Panel>}
-    <Panel title="4. Managed catalog" description="This list shows the latest version for each durable identifier. Client changes append assignment history; they do not rewrite the catalog record."><div className="grid gap-3 lg:grid-cols-2">{assets.length === 0 && <p className="text-sm text-slate-500">No catalog records have been committed.</p>}{assets.map((asset) => <article key={asset.id} className="rounded-xl border border-slate-200 p-4"><div className="flex items-start justify-between gap-3"><div><strong>{asset.title}</strong><p className="mt-1 text-sm text-slate-600">{asset.artist || "Artist not supplied"} · {humanize(asset.itemType)} · {asset.territory}</p><p className="mt-1 break-all font-mono text-xs text-slate-500">{asset.workKey}</p></div><Badge tone="blue">v{asset.version}</Badge></div><div className="mt-3 rounded-lg bg-amber-50 p-3 text-xs text-amber-900">Catalog metadata · authority unverified</div><p className="mt-3 text-sm"><span className="text-slate-500">Managed client:</span> {asset.client?.name || "Unassigned"}</p><details className="mt-3"><summary className="cursor-pointer text-sm font-medium text-blue-800">Append a client assignment</summary><div className="mt-3 space-y-2"><select value={assignmentClients[asset.id] ?? asset.client?.id ?? ""} onChange={(event) => setAssignmentClients((current) => ({ ...current, [asset.id]: event.target.value }))} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="">Unassigned</option>{clients.map((client) => <option key={client.id} value={client.id}>{client.name} · {client.externalReference}</option>)}</select><textarea value={assignmentReasons[asset.id] || ""} onChange={(event) => setAssignmentReasons((current) => ({ ...current, [asset.id]: event.target.value }))} className="min-h-20 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Required reason: contract change, administration transfer, or correction" /><button disabled={busy || !(assignmentReasons[asset.id] || "").trim()} onClick={() => void assign(asset)} className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-medium text-blue-800 disabled:opacity-40">Append assignment</button></div></details></article>)}</div></Panel>
+    {batch && <Panel title={`3. Review ${batch.filename}`} description={`SHA-256 ${batch.fileSha256}. Exact-file replays return this batch instead of creating duplicates.`}><div className="flex flex-wrap gap-2"><Badge tone={batch.status === "committed" ? "green" : "blue"}>{batch.status}</Badge><Badge>{batch.summary.total} rows</Badge><Badge tone={batch.summary.unresolved ? "amber" : "green"}>{batch.summary.unresolved} unresolved</Badge><Badge tone="blue">{batch.summary.importable} importable</Badge><Badge>{batch.summary.skipped} skipped</Badge></div>{batch.status === "preview" && <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm"><button type="button" disabled={busy} onClick={() => void refreshImport()} className="font-medium text-blue-800 disabled:opacity-40">Refresh preview</button><p className="mt-1 text-slate-600">Recheck the same file after a catalog or client change. Previous row decisions stay in the audit history; refreshed rows require a new review.</p></div>}<div className="mt-4 space-y-3">{batch.rows.map((row) => <article key={row.id} className={`rounded-xl border p-4 ${row.status === "invalid" || row.status === "conflict" ? "border-amber-300 bg-amber-50/40" : "border-slate-200"}`}><div className="flex flex-wrap items-start justify-between gap-2"><div><strong>Row {row.rowNumber} · {row.normalized.title || "Untitled"}</strong><p className="mt-1 break-all text-xs text-slate-500">{row.normalized.work_key || "No durable identifier"} · {row.normalized.client_reference || "unassigned"}</p></div><Badge tone={row.status === "imported" ? "green" : row.status === "conflict" || row.status === "invalid" ? "amber" : row.status.startsWith("resolved") ? "blue" : "gray"}>{humanize(row.status)}</Badge></div>{row.errors.length > 0 && <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-amber-900">{row.errors.map((error) => <li key={error}>{error}</li>)}</ul>}{row.existingAsset && <p className="mt-3 text-sm text-slate-600">Existing v{row.existingAsset.version}: {row.existingAsset.title} · {row.existingAsset.artist || "Artist not supplied"} · managed client {row.existingAsset.client?.name || "Unassigned"} · source {row.existingAsset.sourceReference || "not supplied"}</p>}{row.status === "conflict" && <div className="mt-3 space-y-2"><textarea aria-label={`Resolution note for row ${row.rowNumber}`} value={resolutionNotes[row.id] || ""} onChange={(event) => setResolutionNotes((current) => ({ ...current, [row.id]: event.target.value }))} className="min-h-20 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="Record the evidence for skipping this row or creating a corrected version." /><div className="flex flex-wrap gap-2"><button disabled={busy || !(resolutionNotes[row.id] || "").trim()} onClick={() => void resolve(row, "new_version")} className="rounded-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Create immutable next version</button><button disabled={busy || !(resolutionNotes[row.id] || "").trim()} onClick={() => void resolve(row, "skip")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium disabled:opacity-40">Skip this row</button></div></div>}{row.resolutionNote && <p className="mt-2 text-xs text-slate-500">Resolution: {row.resolutionNote}</p>}</article>)}</div>{batch.status === "preview" && <div className="mt-5 rounded-xl border border-slate-300 bg-slate-50 p-4"><label className="flex items-start gap-3 text-sm"><input type="checkbox" checked={confirmImport} onChange={(event) => setConfirmImport(event.target.checked)} className="mt-1" /><span><strong>Commit these catalog records as immutable versions.</strong><span className="mt-1 block text-slate-600">I reviewed these catalog records. Rights and territorial authority will be established through separate evidence review.</span></span></label><button disabled={busy || !confirmImport || batch.summary.unresolved > 0} onClick={() => void commitImport()} className="mt-4 rounded-xl bg-emerald-700 px-5 py-2.5 font-medium text-white disabled:opacity-40">Commit catalog</button>{batch.summary.unresolved > 0 && <p className="mt-2 text-xs text-amber-800">Add missing clients, then refresh the preview. Correct invalid file contents in your CSV and upload the revised file; review catalog conflicts above.</p>}</div>}</Panel>}
+    <Panel title="4. Managed catalog" description="This list shows the latest version of each work or recording. A change of managed client adds a dated assignment, preserving the earlier history."><div className="grid gap-3 lg:grid-cols-2">{assets.length === 0 && <p className="text-sm text-slate-500">No catalog records have been committed.</p>}{assets.map((asset) => <article key={asset.id} className="rounded-xl border border-slate-200 p-4"><div className="flex items-start justify-between gap-3"><div><strong>{asset.title}</strong><p className="mt-1 text-sm text-slate-600">{asset.artist || "Artist not supplied"} · {humanize(asset.itemType)} · {asset.territory}</p><p className="mt-1 break-all font-mono text-xs text-slate-500">{asset.workKey}</p></div><Badge tone="blue">v{asset.version}</Badge></div><div className="mt-3 rounded-lg bg-amber-50 p-3 text-xs text-amber-900">Catalog metadata · rights reviewed separately under Authority</div><p className="mt-3 text-sm"><span className="text-slate-500">Managed client:</span> {asset.client?.name || "Unassigned"}</p><details className="mt-3"><summary className="cursor-pointer text-sm font-medium text-blue-800">Append a client assignment</summary><div className="mt-3 space-y-2"><select aria-label={`Managed client for ${asset.title}`} value={assignmentClients[asset.id] ?? asset.client?.id ?? ""} onChange={(event) => setAssignmentClients((current) => ({ ...current, [asset.id]: event.target.value }))} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="">Unassigned</option>{clients.map((client) => <option key={client.id} value={client.id}>{client.name} · {client.externalReference}</option>)}</select><textarea aria-label={`Assignment reason for ${asset.title}`} value={assignmentReasons[asset.id] || ""} onChange={(event) => setAssignmentReasons((current) => ({ ...current, [asset.id]: event.target.value }))} className="min-h-20 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Required reason: contract change, administration transfer, or correction" /><button disabled={busy || !(assignmentReasons[asset.id] || "").trim()} onClick={() => void assign(asset)} className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-medium text-blue-800 disabled:opacity-40">Append assignment</button></div></details></article>)}</div></Panel>
     {message && <p role="status" className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-700">{message}</p>}
   </div>;
 }
@@ -978,11 +1059,11 @@ function Authority({ session, organization }: { session: SessionCredential; orga
   const [policyId, setPolicyId] = React.useState("");
   const [rightType, setRightType] = React.useState(controlledRightTypes[0] || "composition");
   const [territory, setTerritory] = React.useState(organization.profile?.defaultTerritory || "worldwide");
-  const [source, setSource] = React.useState("mlc");
+  const [source, setSource] = React.useState("");
   const [reference, setReference] = React.useState("");
   const [evidenceUri, setEvidenceUri] = React.useState("");
   const [documentSha256, setDocumentSha256] = React.useState("");
-  const [share, setShare] = React.useState("100.0000");
+  const [share, setShare] = React.useState("");
   const [message, setMessage] = React.useState("");
   const load = React.useCallback(async () => {
     const [claimResponse, policyResponse] = await Promise.all([
@@ -995,11 +1076,60 @@ function Authority({ session, organization }: { session: SessionCredential; orga
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     try {
-      await api("/v1/authority-claims", session, { method: "POST", body: JSON.stringify({ org_id: organization.id, rights_contract_id: policyId, right_type: rightType, territory, evidence: { source, reference, share, evidenceUri: evidenceUri || undefined, documentSha256: documentSha256 || undefined } }) });
-      setMessage("Authority claim sent to the node operator for evidence review."); setReference(""); setEvidenceUri(""); setDocumentSha256(""); await load();
+      await api("/v1/authority-claims", session, { method: "POST", body: JSON.stringify({ org_id: organization.id, rights_contract_id: policyId, right_type: rightType, territory, evidence: { source: source.trim(), reference: reference.trim(), share: share.trim() || undefined, evidenceUri: evidenceUri || undefined, documentSha256: documentSha256 || undefined } }) });
+      setMessage("Authority claim sent to the node operator for evidence review."); setSource(""); setShare(""); setReference(""); setEvidenceUri(""); setDocumentSha256(""); await load();
     } catch (error) { setMessage(error instanceof Error ? error.message : "Claim failed."); }
   }
-  return <div className="grid gap-6 lg:grid-cols-2"><Panel title="Submit an authority claim" description="Identify the right, territory, controlled share, and supporting record. The claim remains self-asserted until a node operator reviews the evidence."><form onSubmit={submit} className="space-y-3"><select required value={policyId} onChange={(event) => setPolicyId(event.target.value)} className="w-full rounded-xl border border-slate-300 px-3 py-2"><option value="">Select a published policy</option>{policies.map((policy) => <option key={policy.id} value={policy.id}>{policy.contract?.metadata?.workTitle || policy.workKey} — {policy.artistName} ({policy.workKey})</option>)}</select><div className="grid gap-3 sm:grid-cols-2"><select value={rightType} onChange={(event) => setRightType(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2">{controlledRightTypes.map((item) => <option key={item}>{item}</option>)}</select><input value={territory} onChange={(event) => setTerritory(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" placeholder="Territory" /></div><div className="grid gap-3 sm:grid-cols-3"><input value={source} onChange={(event) => setSource(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" placeholder="Evidence source (MLC, contract, catalog)" /><input required value={reference} onChange={(event) => setReference(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" placeholder="Registry or document reference" /><input value={share} onChange={(event) => setShare(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" placeholder="Controlled share (%)" /></div><div className="grid gap-3 sm:grid-cols-2"><input type="text" inputMode="url" value={evidenceUri} onChange={(event) => setEvidenceUri(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" placeholder="Evidence location · https:// or urn: (optional)" /><input value={documentSha256} onChange={(event) => setDocumentSha256(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2 font-mono text-sm" placeholder="Document SHA-256 · 64 hex characters (optional)" /></div><p className="text-xs leading-5 text-slate-500">Keep private contracts in your document system. A stable location and SHA-256 fingerprint let the operator identify the exact artifact reviewed without uploading it to Clef.</p><button className="rounded-xl bg-blue-700 px-5 py-2.5 font-medium text-white">Send for review</button>{message && <p className="text-sm text-slate-600">{message}</p>}</form></Panel><Panel title="Authority record" description="Only a verified claim can receive or approve a permission request."><div className="space-y-3">{claims.length === 0 && <p className="text-sm text-slate-500">No authority claim has been submitted.</p>}{claims.map((claim) => <div key={claim.id} className="rounded-xl border border-slate-200 p-4"><div className="flex items-center justify-between"><strong>{claim.workKey}</strong><Badge tone={claim.status === "verified" ? "green" : claim.status === "rejected" ? "red" : "amber"}>{claim.status}</Badge></div><p className="mt-2 text-sm text-slate-600">{humanize(claim.rightType)} · {claim.territory}</p></div>)}</div></Panel></div>;
+  const inputClass = "mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 font-normal";
+  return <div className="grid gap-6 lg:grid-cols-2">
+    <Panel title="Submit an authority claim" description="Identify the right, territory, controlled share, and supporting record. A node operator reviews the evidence before verifying the claim.">
+      <form onSubmit={submit} className="space-y-4">
+        <label className="block text-sm font-medium text-slate-800">Published policy
+          <select required value={policyId} onChange={(event) => setPolicyId(event.target.value)} className={inputClass}>
+            <option value="">Select a published policy</option>
+            {policies.map((policy) => <option key={policy.id} value={policy.id}>{policy.contract?.metadata?.workTitle || policy.workKey} — {policy.artistName} ({policy.workKey})</option>)}
+          </select>
+        </label>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block text-sm font-medium text-slate-800">Right administered
+            <select value={rightType} onChange={(event) => setRightType(event.target.value)} className={inputClass}>{controlledRightTypes.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</select>
+          </label>
+          <label className="block text-sm font-medium text-slate-800">Territory
+            <input required value={territory} onChange={(event) => setTerritory(event.target.value)} className={inputClass} placeholder="US, CA, or worldwide" />
+          </label>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block text-sm font-medium text-slate-800">Evidence source
+            <input required maxLength={120} value={source} onChange={(event) => setSource(event.target.value)} className={inputClass} placeholder="e.g. signed recording agreement" />
+          </label>
+          <label className="block text-sm font-medium text-slate-800">Registry or document reference
+            <input required maxLength={500} value={reference} onChange={(event) => setReference(event.target.value)} className={inputClass} placeholder="Your document or registry reference" />
+          </label>
+        </div>
+        <label className="block text-sm font-medium text-slate-800">Controlled share (%) — optional
+          <input type="number" min="0" max="100" step="any" value={share} onChange={(event) => setShare(event.target.value)} className={inputClass} aria-describedby="authority-share-help" placeholder="Enter the share supported by your evidence" />
+        </label>
+        <p id="authority-share-help" className="text-xs leading-5 text-slate-500">Enter the share your organization administers for this right and territory. Leave it blank when the evidence does not establish a percentage; the operator reviews it as an unspecified share.</p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block text-sm font-medium text-slate-800">Evidence location — optional
+            <input type="text" inputMode="url" value={evidenceUri} onChange={(event) => setEvidenceUri(event.target.value)} className={inputClass} placeholder="https:// or urn:" />
+          </label>
+          <label className="block text-sm font-medium text-slate-800">Document SHA-256 — optional
+            <input value={documentSha256} onChange={(event) => setDocumentSha256(event.target.value)} className={`${inputClass} font-mono`} placeholder="64 hexadecimal characters" />
+          </label>
+        </div>
+        <p className="text-xs leading-5 text-slate-500">Keep private contracts in your document system. A stable location and SHA-256 fingerprint let the operator identify the exact artifact reviewed.</p>
+        <button className="rounded-xl bg-blue-700 px-5 py-2.5 font-medium text-white">Send for review</button>
+        {message && <p role="status" className="text-sm text-slate-600">{message}</p>}
+      </form>
+    </Panel>
+    <Panel title="Authority record" description="Only a verified claim can receive or approve a permission request.">
+      <div className="space-y-3">
+        {claims.length === 0 && <p className="text-sm text-slate-500">No authority claim has been submitted.</p>}
+        {claims.map((claim) => <div key={claim.id} className="rounded-xl border border-slate-200 p-4"><div className="flex items-center justify-between"><strong>{policies.find(policy => policy.id === claim.rightsContractId)?.contract?.metadata?.workTitle || claim.workKey}</strong><Badge tone={claim.status === "verified" ? "green" : claim.status === "rejected" || claim.status === "revoked" ? "red" : "amber"}>{claim.status}</Badge></div><p className="mt-2 text-sm text-slate-600">{humanize(claim.rightType)} · {claim.territory}</p><p className="mt-1 break-all font-mono text-xs text-slate-500">{claim.workKey}</p>{["verified", "self_asserted", "disputed"].includes(claim.status) && <AuthorityWithdrawal key={`${session.id}:${organization.id}:${claim.id}`} apiBase={API_BASE} sessionId={session.id} organizationId={organization.id} claimId={claim.id} onChanged={load} />}</div>)}
+      </div>
+    </Panel>
+  </div>;
 }
 
 function RequestPermission({ session, organization }: { session: SessionCredential; organization: Organization }) {
@@ -1010,6 +1140,8 @@ function RequestPermission({ session, organization }: { session: SessionCredenti
   const [termStart, setTermStart] = React.useState("");
   const [termEnd, setTermEnd] = React.useState("");
   const [releaseTitle, setReleaseTitle] = React.useState("");
+  const [restrictionCategories, setRestrictionCategories] = React.useState<string[]>([]);
+  const [contentConfirmed, setContentConfirmed] = React.useState(false);
   const [inputAssets, setInputAssets] = React.useState<string[]>(["full_mix"]);
   const [modelScope, setModelScope] = React.useState("private_single_tenant");
   const [aiLimits, setAiLimits] = React.useState<Record<string, string>>({ sourceDurationSeconds: "", outputDurationSeconds: "", lyricCharacters: "", sourceRetentionDays: "", embeddingRetentionDays: "" });
@@ -1017,7 +1149,7 @@ function RequestPermission({ session, organization }: { session: SessionCredenti
   const [message, setMessage] = React.useState("");
   React.useEffect(() => void api<{ claims: DirectoryClaim[] }>("/v1/directory/authority-claims", session).then((data) => setClaims(data.claims)).catch((error) => setMessage(error.message)), [session]);
   const selected = claims.find((claim) => claim.id === selectedId);
-  const isAiUsage = (AI_USAGE_KEYS as readonly string[]).includes(usage);
+  const isAiUsage = isAiUsageKey(usage);
   const requiredSafeguards = selected ? AI_SAFEGUARD_KEYS.filter((key) => selected.aiPolicy?.safeguards?.[key]) : [];
   function toggleInputAsset(asset: string) {
     setInputAssets((current) => current.includes(asset) ? current.filter((item) => item !== asset) : [...current, asset]);
@@ -1027,6 +1159,7 @@ function RequestPermission({ session, organization }: { session: SessionCredenti
   }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
+    if (!contentConfirmed) { setMessage("Confirm the content categories before submitting."); return; }
     if (!selected) return;
     try {
       const aiUse = isAiUsage ? {
@@ -1035,18 +1168,18 @@ function RequestPermission({ session, organization }: { session: SessionCredenti
         acceptedSafeguards,
         ...Object.fromEntries(Object.entries(aiLimits).map(([key, value]) => [key, value === "" ? null : Number(value)])),
       } : undefined;
-      const response = await api<{ status: string }>("/v1/permission-requests", session, { method: "POST", body: JSON.stringify({ requester_org_id: organization.id, authority_claim_id: selected.id, intended_usage: usage, territory, term_start: termStart || null, term_end: termEnd || null, context: { releaseTitle, ...(aiUse ? { aiUse } : {}) }, provenance: {} }) });
+      const response = await api<{ status: string }>("/v1/permission-requests", session, { method: "POST", body: JSON.stringify({ requester_org_id: organization.id, authority_claim_id: selected.id, intended_usage: usage, territory, term_start: termStart || null, term_end: termEnd || null, context: { releaseTitle, restrictionCategories, ...(aiUse ? { aiUse } : {}) }, provenance: {} }) });
       setMessage(response.status === "approved" ? "Approved automatically under the published policy; a signed receipt was issued." : "Request sent to the verified rights authority.");
     } catch (error) { setMessage(error instanceof Error ? error.message : "Request failed."); }
   }
-  return <Panel title="Request permission" description="Select a verified claim, then state the operation, source material, model environment, territory, and term. The receipt preserves that exact scope."><form onSubmit={submit} className="space-y-4"><select required value={selectedId} onChange={(event) => { setSelectedId(event.target.value); setAcceptedSafeguards([]); }} className="w-full rounded-xl border border-slate-300 px-3 py-2"><option value="">Select a verified work and authority</option>{claims.map((claim) => <option key={claim.id} value={claim.id}>{claim.workTitle || claim.workKey} — {claim.organization.name} ({claim.rightType}; {claim.workKey})</option>)}</select>{selected && <div className="rounded-xl bg-slate-50 p-4 text-sm"><div className="flex justify-between"><span>Published rule for {humanize(usage)}</span><Badge tone={selected.matrix.usage[usage] === "allowed" ? "green" : selected.matrix.usage[usage] === "blocked" ? "red" : "amber"}>{selected.matrix.usage[usage]}</Badge></div><p className="mt-2 text-slate-600">This claim covers {humanize(selected.rightType)}. Master, composition, lyrics, performance, voice, or likeness permission may still be required.</p></div>}<div className="grid gap-3 md:grid-cols-2"><select value={usage} onChange={(event) => setUsage(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2"><optgroup label="AI operations">{AI_USAGE_KEYS.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</optgroup><optgroup label="Other uses">{STANDARD_USAGE_KEYS.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</optgroup><optgroup label="Legacy compatibility">{LEGACY_AI_USAGE_KEYS.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</optgroup></select><input required value={territory} onChange={(event) => setTerritory(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" placeholder="Territory" /><input required type="text" inputMode="numeric" pattern="\d{4}-\d{2}-\d{2}" aria-label="License start date" placeholder="Start date · YYYY-MM-DD" value={termStart} onChange={(event) => setTermStart(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" /><input required type="text" inputMode="numeric" pattern="\d{4}-\d{2}-\d{2}" aria-label="License end date" placeholder="End date · YYYY-MM-DD" value={termEnd} onChange={(event) => setTermEnd(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" /><input value={releaseTitle} onChange={(event) => setReleaseTitle(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2 md:col-span-2" placeholder="Proposed release or project title" /></div>{isAiUsage && <section className="space-y-4 rounded-2xl border border-blue-200 bg-blue-50/40 p-4"><div><h3 className="font-medium text-slate-950">Declare the AI system’s exact use</h3><p className="mt-1 text-sm text-slate-600">Grounded generation and embeddings are licensed operations, not incidental technical details. Declare every source asset and retention period.</p></div><fieldset><legend className="text-sm font-medium text-slate-800">Source materials entering the system</legend><div className="mt-2 grid gap-2 sm:grid-cols-3">{AI_INPUT_KEYS.map((asset) => <label key={asset} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white p-3 text-sm"><input type="checkbox" checked={inputAssets.includes(asset)} onChange={() => toggleInputAsset(asset)} />{humanize(asset)}</label>)}</div></fieldset><label className="block text-sm font-medium text-slate-800">Model environment<select value={modelScope} onChange={(event) => setModelScope(event.target.value)} className="mt-2 w-full rounded-xl border border-slate-300 bg-white px-3 py-2">{AI_MODEL_SCOPE_KEYS.map((scope) => <option key={scope} value={scope}>{humanize(scope)}</option>)}</select></label><div className="grid gap-3 sm:grid-cols-2">{Object.entries({ sourceDurationSeconds: "Source duration used (seconds)", outputDurationSeconds: "Maximum output duration (seconds)", lyricCharacters: "Lyric characters supplied", sourceRetentionDays: "Source retention (days)", embeddingRetentionDays: "Embedding retention (days)" }).map(([key, label]) => <label key={key} className="text-sm text-slate-700">{label}<input type="number" min="0" value={aiLimits[key]} onChange={(event) => setAiLimits((current) => ({ ...current, [key]: event.target.value }))} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2" placeholder="Declare or settle in license" /></label>)}</div>{selected && requiredSafeguards.length > 0 && <fieldset><legend className="text-sm font-medium text-slate-800">Controls required by the published policy</legend><p className="mt-1 text-xs text-slate-600">Accepting these controls records them in the request and signed receipt; it does not claim they have already been performed.</p><div className="mt-2 grid gap-2 sm:grid-cols-2">{requiredSafeguards.map((safeguard) => <label key={safeguard} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white p-3 text-sm"><input type="checkbox" checked={acceptedSafeguards.includes(safeguard)} onChange={() => toggleSafeguard(safeguard)} />{humanize(safeguard)}</label>)}</div></fieldset>}</section>}<button disabled={!selected || !termStart || !termEnd || selected.matrix.usage[usage] === "blocked" || (isAiUsage && (inputAssets.length === 0 || requiredSafeguards.some((item) => !acceptedSafeguards.includes(item))))} className="rounded-xl bg-blue-700 px-5 py-2.5 font-medium text-white disabled:cursor-not-allowed disabled:opacity-40">Request permission</button>{message && <p className="text-sm text-slate-600">{message}</p>}</form></Panel>;
+  return <Panel title="Request permission" description="Select a verified claim, then state the operation, source material, model environment, territory, and term. The receipt preserves that exact scope."><form onSubmit={submit} className="space-y-4"><select required value={selectedId} onChange={(event) => { setSelectedId(event.target.value); setAcceptedSafeguards([]); setContentConfirmed(false); }} className="w-full rounded-xl border border-slate-300 px-3 py-2"><option value="">Select a verified work and authority</option>{claims.map((claim) => <option key={claim.id} value={claim.id}>{claim.workTitle || claim.workKey} — {claim.organization.name} ({claim.rightType}; {claim.workKey})</option>)}</select>{selected && <div className="rounded-xl bg-slate-50 p-4 text-sm"><div className="flex justify-between"><span>Published rule for {humanize(usage)}</span><Badge tone={selected.matrix.usage[usage] === "allowed" ? "green" : selected.matrix.usage[usage] === "blocked" ? "red" : "amber"}>{selected.matrix.usage[usage]}</Badge></div><p className="mt-2 text-slate-600">This claim covers {humanize(selected.rightType)} in {selected.territory}. Master, composition, lyrics, performance, voice, or likeness permission may still be required.</p></div>}<div className="grid gap-3 md:grid-cols-2"><select value={usage} onChange={(event) => setUsage(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2"><optgroup label="AI operations">{AI_USAGE_KEYS.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</optgroup><optgroup label="Other uses">{STANDARD_USAGE_KEYS.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</optgroup><optgroup label="Legacy compatibility">{LEGACY_AI_USAGE_KEYS.map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</optgroup></select><input required value={territory} onChange={(event) => setTerritory(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" aria-label="Requested territory" placeholder="Country codes, e.g. US, CA; or worldwide" /><input required type="text" inputMode="numeric" pattern="\d{4}-\d{2}-\d{2}" aria-label="License start date" placeholder="Start date · YYYY-MM-DD" value={termStart} onChange={(event) => setTermStart(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" /><input required type="text" inputMode="numeric" pattern="\d{4}-\d{2}-\d{2}" aria-label="License end date" placeholder="End date · YYYY-MM-DD" value={termEnd} onChange={(event) => setTermEnd(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2" /><input value={releaseTitle} onChange={(event) => setReleaseTitle(event.target.value)} className="rounded-xl border border-slate-300 px-3 py-2 md:col-span-2" placeholder="Proposed release or project title" /></div>{isAiUsage && <section className="space-y-4 rounded-2xl border border-blue-200 bg-blue-50/40 p-4"><div><h3 className="font-medium text-slate-950">Declare the AI system’s exact use</h3><p className="mt-1 text-sm text-slate-600">Grounded generation and embeddings are licensed operations, not incidental technical details. Declare every source asset and retention period.</p></div><fieldset><legend className="text-sm font-medium text-slate-800">Source materials entering the system</legend><div className="mt-2 grid gap-2 sm:grid-cols-3">{AI_INPUT_KEYS.map((asset) => <label key={asset} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white p-3 text-sm"><input type="checkbox" checked={inputAssets.includes(asset)} onChange={() => toggleInputAsset(asset)} />{humanize(asset)}</label>)}</div></fieldset><label className="block text-sm font-medium text-slate-800">Model environment<select value={modelScope} onChange={(event) => setModelScope(event.target.value)} className="mt-2 w-full rounded-xl border border-slate-300 bg-white px-3 py-2">{AI_MODEL_SCOPE_KEYS.map((scope) => <option key={scope} value={scope}>{humanize(scope)}</option>)}</select></label><div className="grid gap-3 sm:grid-cols-2">{Object.entries({ sourceDurationSeconds: "Source duration used (seconds)", outputDurationSeconds: "Maximum output duration (seconds)", lyricCharacters: "Lyric characters supplied", sourceRetentionDays: "Source retention (days)", embeddingRetentionDays: "Embedding retention (days)" }).map(([key, label]) => <label key={key} className="text-sm text-slate-700">{label}<input type="number" min="0" value={aiLimits[key]} onChange={(event) => setAiLimits((current) => ({ ...current, [key]: event.target.value }))} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2" placeholder="Declare or settle in license" /></label>)}</div>{selected && requiredSafeguards.length > 0 && <fieldset><legend className="text-sm font-medium text-slate-800">Controls required by the published policy</legend><p className="mt-1 text-xs text-slate-600">Accepting these controls records them in the request and signed receipt; it does not claim they have already been performed.</p><div className="mt-2 grid gap-2 sm:grid-cols-2">{requiredSafeguards.map((safeguard) => <label key={safeguard} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white p-3 text-sm"><input type="checkbox" checked={acceptedSafeguards.includes(safeguard)} onChange={() => toggleSafeguard(safeguard)} />{humanize(safeguard)}</label>)}</div></fieldset>}</section>}<fieldset className="space-y-3 rounded-xl border border-slate-200 p-4"><legend className="px-1 font-medium text-slate-900">Content and associations</legend><p className="text-sm text-slate-600">Select every category associated with the proposed use. The artist’s published conditions apply to these choices.</p><div className="grid gap-2 sm:grid-cols-2">{RESTRICTION_KEYS.map((category) => <label key={category} className="flex items-start gap-2 text-sm"><input type="checkbox" checked={restrictionCategories.includes(category)} onChange={() => { setRestrictionCategories((current) => current.includes(category) ? current.filter((item) => item !== category) : [...current, category]); setContentConfirmed(false); }} />{humanize(category)}{selected && <span className="text-slate-500">({selected.matrix.restrictions[category]})</span>}</label>)}</div><label className="flex items-start gap-2 border-t border-slate-200 pt-3 text-sm"><input required type="checkbox" checked={contentConfirmed} onChange={(event) => setContentConfirmed(event.target.checked)} />I have reviewed every category. My selections describe this use; leaving all categories clear means none apply.</label></fieldset><button disabled={!contentConfirmed || !selected || !termStart || !termEnd || selected.matrix.usage[usage] === "blocked" || (isAiUsage && (inputAssets.length === 0 || requiredSafeguards.some((item) => !acceptedSafeguards.includes(item))))} className="rounded-xl bg-blue-700 px-5 py-2.5 font-medium text-white disabled:cursor-not-allowed disabled:opacity-40">Request permission</button>{message && <p className="text-sm text-slate-600">{message}</p>}</form></Panel>;
 }
 
 function PermissionScope({ permission }: { permission: Permission }) {
   const aiUse = permission.context?.aiUse as Record<string, any> | undefined;
   const evaluation = permission.context?.policyEvaluation as { state?: string; reasons?: string[] } | undefined;
   const term = permission.termStart && permission.termEnd ? `${permission.termStart} through ${permission.termEnd}` : "Not declared — approval is blocked";
-  return <section className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm"><h3 className="font-medium text-slate-900">Declared license scope</h3><dl className="mt-3 grid gap-3 sm:grid-cols-3"><div><dt className="text-xs uppercase tracking-wide text-slate-500">Term</dt><dd className={!permission.termStart || !permission.termEnd ? "font-medium text-red-700" : "text-slate-800"}>{term}</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Project</dt><dd>{permission.context?.releaseTitle || "Not supplied"}</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Policy evaluation</dt><dd>{evaluation?.state ? humanize(evaluation.state) : "Not recorded"}</dd></div></dl>{aiUse && <div className="mt-4 border-t border-slate-200 pt-3"><dl className="grid gap-3 sm:grid-cols-2"><div><dt className="text-xs uppercase tracking-wide text-slate-500">Source material</dt><dd>{(aiUse.inputAssets || []).map(humanize).join(", ") || "Not declared"}</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Model environment</dt><dd>{humanize(aiUse.modelScope || "not_declared")}</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Durations</dt><dd>Source {aiUse.sourceDurationSeconds ?? "unset"}s · output {aiUse.outputDurationSeconds ?? "unset"}s · lyrics {aiUse.lyricCharacters ?? "unset"} characters</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Retention</dt><dd>Source {aiUse.sourceRetentionDays ?? "unset"} days · embeddings {aiUse.embeddingRetentionDays ?? "unset"} days</dd></div><div className="sm:col-span-2"><dt className="text-xs uppercase tracking-wide text-slate-500">Accepted controls</dt><dd>{(aiUse.acceptedSafeguards || []).map(humanize).join(", ") || "None declared"}</dd></div></dl></div>}{evaluation?.reasons?.length ? <details className="mt-3"><summary className="cursor-pointer text-xs font-medium text-slate-600">Policy evaluation trace</summary><p className="mt-2 break-words text-xs text-slate-500">{evaluation.reasons.join(" · ")}</p></details> : null}{Object.keys(permission.provenance || {}).length > 0 && <details className="mt-3"><summary className="cursor-pointer text-xs font-medium text-slate-600">Submitted provenance</summary><pre className="mt-2 overflow-auto text-xs text-slate-600">{JSON.stringify(permission.provenance, null, 2)}</pre></details>}</section>;
+  return <section className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm"><h3 className="font-medium text-slate-900">Declared license scope</h3><dl className="mt-3 grid gap-3 sm:grid-cols-3"><div><dt className="text-xs uppercase tracking-wide text-slate-500">Term</dt><dd className={!permission.termStart || !permission.termEnd ? "font-medium text-red-700" : "text-slate-800"}>{term}</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Project</dt><dd>{permission.context?.releaseTitle || "Not supplied"}</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Policy evaluation</dt><dd>{evaluation?.state ? humanize(evaluation.state) : "Not recorded"}</dd></div></dl><p className="mt-3"><strong>Content categories:</strong> {Array.isArray(permission.context?.restrictionCategories) ? (permission.context.restrictionCategories.map(humanize).join(", ") || "Requester declares none apply") : "Declaration needed for content restrictions"}</p>{aiUse && <div className="mt-4 border-t border-slate-200 pt-3"><dl className="grid gap-3 sm:grid-cols-2"><div><dt className="text-xs uppercase tracking-wide text-slate-500">Source material</dt><dd>{(aiUse.inputAssets || []).map(humanize).join(", ") || "Not declared"}</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Model environment</dt><dd>{humanize(aiUse.modelScope || "not_declared")}</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Durations</dt><dd>Source {aiUse.sourceDurationSeconds ?? "unset"}s · output {aiUse.outputDurationSeconds ?? "unset"}s · lyrics {aiUse.lyricCharacters ?? "unset"} characters</dd></div><div><dt className="text-xs uppercase tracking-wide text-slate-500">Retention</dt><dd>Source {aiUse.sourceRetentionDays ?? "unset"} days · embeddings {aiUse.embeddingRetentionDays ?? "unset"} days</dd></div><div className="sm:col-span-2"><dt className="text-xs uppercase tracking-wide text-slate-500">Accepted controls</dt><dd>{(aiUse.acceptedSafeguards || []).map(humanize).join(", ") || "None declared"}</dd></div></dl></div>}{evaluation?.reasons?.length ? <details className="mt-3"><summary className="cursor-pointer text-xs font-medium text-slate-600">Policy evaluation trace</summary><p className="mt-2 break-words text-xs text-slate-500">{evaluation.reasons.join(" · ")}</p></details> : null}{Object.keys(permission.provenance || {}).length > 0 && <details className="mt-3"><summary className="cursor-pointer text-xs font-medium text-slate-600">Submitted provenance</summary><pre className="mt-2 overflow-auto text-xs text-slate-600">{JSON.stringify(permission.provenance, null, 2)}</pre></details>}</section>;
 }
 
 function DdexAcknowledgementEvidence({ session, exchangeId }: { session: SessionCredential; exchangeId: string }) {
@@ -1169,11 +1302,15 @@ function ReceiptVerification({ inspection }: { inspection: ReceiptInspection }) 
 type BeneficiaryDraft = { name: string; identifier: string; shareBps: string };
 
 function financialIdempotencyKey(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return clientOperationKey(prefix);
 }
 
-function SettlementLedgerCore({ session, permission }: { session: SessionCredential; permission: Permission }) {
+export function SettlementLedgerCore({ session, permission }: { session: SessionCredential; permission: Permission }) {
   const [settlement, setSettlement] = React.useState<Settlement | null>(null);
+  const settlementIdRef = React.useRef(permission.settlementId);
+  const financialBusyRef = React.useRef(false);
+  const [financialBusy, setFinancialBusy] = React.useState(false);
+  const pendingFinancialRequest = React.useRef<{ fingerprint: string; body: string } | null>(null);
   const [loading, setLoading] = React.useState(Boolean(permission.settlementId));
   const [currency, setCurrency] = React.useState("USD");
   const [minimumMinor, setMinimumMinor] = React.useState("0");
@@ -1198,7 +1335,7 @@ function SettlementLedgerCore({ session, permission }: { session: SessionCredent
   const outbound = permission.directions.includes("outbound");
 
   const load = React.useCallback(async () => {
-    if (!permission.settlementId) { setSettlement(null); setLoading(false); return; }
+    if (!settlementIdRef.current && !permission.settlementId) { setSettlement(null); setLoading(false); return; }
     setLoading(true);
     try {
       setSettlement(await api<Settlement>(`/v1/permission-requests/${permission.id}/settlement`, session));
@@ -1215,19 +1352,66 @@ function SettlementLedgerCore({ session, permission }: { session: SessionCredent
 
   async function createTerms(event: React.FormEvent) {
     event.preventDefault();
+    if (financialBusyRef.current) return;
     const minimum = Number(minimumMinor);
     const rate = Number(royaltyRateBps);
     const beneficiaries = beneficiaryDrafts.map((row) => ({ name: row.name.trim(), identifier: row.identifier.trim(), share_bps: Number(row.shareBps) }));
     if (![minimum, rate, ...beneficiaries.map((row) => row.share_bps)].every(Number.isSafeInteger)) { setMessage("Money and shares must use whole minor units and basis points."); return; }
     if (beneficiaries.reduce((sum, row) => sum + row.share_bps, 0) !== 10000) { setMessage("Beneficiary shares must total exactly 10,000 basis points."); return; }
+    financialBusyRef.current = true;
+    setFinancialBusy(true);
     try {
       const created = await api<Settlement>(`/v1/permission-requests/${permission.id}/settlement`, session, {
         method: "POST",
         body: JSON.stringify({ currency, minimum_commitment_minor: minimum, minimum_recoupable: minimumRecoupable, royalty_rate_bps: rate, royalty_basis: royaltyBasis, beneficiaries, terms: {}, confirm_immutable_terms: termsConfirmed }),
       });
+      settlementIdRef.current = created.id;
       setSettlement(created);
       setMessage("Immutable settlement terms recorded. They remain provisional until a grant, external payment evidence, beneficiary payouts, and reconciliation exist.");
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Could not record settlement terms."); }
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        try {
+          const existing = await api<Settlement>(`/v1/permission-requests/${permission.id}/settlement`, session);
+          settlementIdRef.current = existing.id;
+          setSettlement(existing);
+          setMessage("Settlement terms already exist. Review the recorded terms below.");
+        } catch { setMessage(error.message); }
+      } else setMessage(error instanceof Error ? error.message : "Could not record settlement terms.");
+    } finally { financialBusyRef.current = false; setFinancialBusy(false); }
+  }
+
+  async function recordFinancialOperation<T>(
+    path: string,
+    payload: Record<string, unknown>,
+    onRecorded: (result: T) => void,
+  ) {
+    if (financialBusyRef.current) return;
+    const fingerprint = JSON.stringify({ path, payload });
+    if (pendingFinancialRequest.current && pendingFinancialRequest.current.fingerprint !== fingerprint) {
+      setMessage("A previous submission still needs confirmation. Retry its unchanged details before recording another entry.");
+      return;
+    }
+    if (!pendingFinancialRequest.current) {
+      pendingFinancialRequest.current = {
+        fingerprint,
+        body: JSON.stringify({ ...payload, idempotency_key: financialIdempotencyKey("settlement") }),
+      };
+    }
+    financialBusyRef.current = true;
+    setFinancialBusy(true);
+    try {
+      const result = await api<T>(path, session, { method: "POST", body: pendingFinancialRequest.current.body });
+      pendingFinancialRequest.current = null;
+      onRecorded(result);
+      try { await load(); }
+      catch { setMessage("Recorded successfully. The refreshed ledger could not be loaded; use Refresh ledger to view it."); }
+    } catch (error) {
+      // Validation failures can be corrected. Ambiguous failures retain the exact
+      // operation and key, so a retry cannot append a second immutable record.
+      if (error instanceof ApiError && [400, 422].includes(error.status)) pendingFinancialRequest.current = null;
+      const detail = error instanceof Error ? error.message : "Could not confirm the financial record.";
+      setMessage(pendingFinancialRequest.current ? `${detail} Retry with the same details to confirm this submission.` : detail);
+    } finally { financialBusyRef.current = false; setFinancialBusy(false); }
   }
 
   async function appendEntry(event: React.FormEvent) {
@@ -1235,22 +1419,16 @@ function SettlementLedgerCore({ session, permission }: { session: SessionCredent
     if (!settlement) return;
     const amount = Number(entryAmount);
     if (!Number.isSafeInteger(amount) || amount <= 0) { setMessage("Enter a positive whole amount in currency minor units."); return; }
-    try {
-      await api(`/v1/settlements/${settlement.id}/entries`, session, {
-        method: "POST",
-        body: JSON.stringify({
+    await recordFinancialOperation(`/v1/settlements/${settlement.id}/entries`, {
           kind: entryKind,
           amount_minor: amount,
           beneficiary_id: ["payout", "payout_reversal"].includes(entryKind) ? entryBeneficiary : null,
           external_reference: externalReference.trim() || null,
           evidence: entryKind === "reserve" ? {} : { reference: evidenceReference.trim() || externalReference.trim() },
-          idempotency_key: financialIdempotencyKey(entryKind),
-        }),
-      });
+      }, () => {
       setEntryAmount(""); setExternalReference(""); setEvidenceReference("");
       setMessage(`${humanize(entryKind)} appended. Existing ledger records were not changed.`);
-      await load();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Could not append the financial record."); }
+      });
   }
 
   async function calculateRoyalty(event: React.FormEvent) {
@@ -1258,50 +1436,47 @@ function SettlementLedgerCore({ session, permission }: { session: SessionCredent
     if (!settlement) return;
     const amount = Number(basisAmount);
     if (!Number.isSafeInteger(amount) || amount <= 0) { setMessage("Enter a positive whole revenue amount in currency minor units."); return; }
-    try {
-      await api(`/v1/settlements/${settlement.id}/royalty-calculations`, session, {
-        method: "POST",
-        body: JSON.stringify({ basis_amount_minor: amount, period_start: periodStart, period_end: periodEnd, external_reference: statementReference.trim(), evidence: { reference: statementReference.trim() }, idempotency_key: financialIdempotencyKey("royalty") }),
-      });
+    await recordFinancialOperation(`/v1/settlements/${settlement.id}/royalty-calculations`,
+      { basis_amount_minor: amount, period_start: periodStart, period_end: periodEnd, external_reference: statementReference.trim(), evidence: { reference: statementReference.trim() } }, () => {
       setBasisAmount(""); setStatementReference("");
       setMessage("Royalty accrual calculated with exact integer rounding and appended to the ledger.");
-      await load();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Royalty calculation failed."); }
+      });
   }
 
   async function reconcile() {
     if (!settlement) return;
-    try {
-      const result = await api<{ assertionType: string; status: string }>(`/v1/settlements/${settlement.id}/reconciliations`, session, {
-        method: "POST",
-        body: JSON.stringify({ idempotency_key: financialIdempotencyKey("reconcile"), evidence: reconciliationNote.trim() ? { note: reconciliationNote.trim() } : {} }),
-      });
+    await recordFinancialOperation<{ assertionType: string; status: string }>(`/v1/settlements/${settlement.id}/reconciliations`,
+      { evidence: reconciliationNote.trim() ? { note: reconciliationNote.trim() } : {} }, (result) => {
       setMessage(result.assertionType === "paid" ? "Reconciled: obligation, received payment, and every beneficiary payout match exactly." : "Reconciliation recorded as provisional: one or more balances still differ.");
       setReconciliationNote("");
-      await load();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Reconciliation failed."); }
+      });
   }
 
   async function inspectReconciliation(receiptId: string) {
     try {
-      const receipt = await api<Record<string, any>>(`/v1/receipts/${receiptId}`);
+      const receipt = await api<Record<string, any>>(`/v1/receipts/${receiptId}`, session);
       const verification = await api<ReceiptInspection["verification"]>("/v1/receipts/verify", undefined, { method: "POST", body: JSON.stringify({ receipt }) });
       setReconciliationInspections((current) => ({ ...current, [receiptId]: { receipt, verification } }));
     } catch (error) { setMessage(error instanceof Error ? error.message : "Reconciliation receipt verification failed."); }
   }
 
+  async function downloadReconciliation(receiptId: string) {
+    try { await downloadPrivateReceipt(receiptId, session); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Receipt download failed."); }
+  }
+
   if (loading) return <section className="mt-4 rounded-xl border border-slate-200 p-4 text-sm text-slate-500">Loading settlement ledger…</section>;
-  if (!settlement) return <section className="mt-4 rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="font-medium text-slate-950">Settlement ledger</h3><p className="mt-1 text-sm text-slate-600">A reserve or proposed fee is provisional. It never grants permission.</p></div><Badge tone="amber">not configured</Badge></div>{inbound ? <details className="mt-3"><summary className="cursor-pointer text-sm font-medium text-blue-800">Define immutable settlement terms</summary><form onSubmit={createTerms} className="mt-3 space-y-3 rounded-xl bg-slate-50 p-4"><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><label className="text-sm">Currency<input required maxLength={3} value={currency} onChange={(event) => setCurrency(event.target.value.toUpperCase())} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" /></label><label className="text-sm">Minimum · minor units<input required type="number" min="0" value={minimumMinor} onChange={(event) => setMinimumMinor(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" /></label><label className="text-sm">Royalty rate · basis points<input required type="number" min="0" max="10000" value={royaltyRateBps} onChange={(event) => setRoyaltyRateBps(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" /></label><label className="text-sm">Royalty basis<select value={royaltyBasis} onChange={(event) => setRoyaltyBasis(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"><option value="net_revenue">Net revenue</option><option value="gross_revenue">Gross revenue</option><option value="net_receipts">Net receipts</option></select></label></div><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={minimumRecoupable} onChange={(event) => setMinimumRecoupable(event.target.checked)} />Minimum is recoupable against royalties</label><fieldset><legend className="text-sm font-medium">Beneficiaries · shares must total 10,000 bps</legend><div className="mt-2 space-y-2">{beneficiaryDrafts.map((row, index) => <div key={index} className="grid gap-2 sm:grid-cols-[1fr_1fr_10rem_auto]"><input required aria-label={`Beneficiary ${index + 1} name`} value={row.name} onChange={(event) => updateBeneficiary(index, "name", event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Artist or owner" /><input required aria-label={`Beneficiary ${index + 1} identifier`} value={row.identifier} onChange={(event) => updateBeneficiary(index, "identifier", event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="IPI, party ID, or contract ID" /><input required aria-label={`Beneficiary ${index + 1} share`} type="number" min="1" max="10000" value={row.shareBps} onChange={(event) => updateBeneficiary(index, "shareBps", event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Share bps" /><button type="button" disabled={beneficiaryDrafts.length === 1} onClick={() => setBeneficiaryDrafts((current) => current.filter((_, rowIndex) => rowIndex !== index))} className="rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:opacity-40">Remove</button></div>)}</div><button type="button" onClick={() => setBeneficiaryDrafts((current) => [...current, { name: "", identifier: "", shareBps: "" }])} className="mt-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">Add beneficiary</button></fieldset><label className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-slate-700"><input required type="checkbox" checked={termsConfirmed} onChange={(event) => setTermsConfirmed(event.target.checked)} className="mt-1" />I reviewed the currency, minimum, royalty basis, and complete split. These terms cannot be edited; a correction requires a replacement permission.</label><button disabled={!termsConfirmed} className="rounded-lg bg-blue-700 px-4 py-2 text-sm font-medium text-white disabled:opacity-40">Record settlement terms</button></form></details> : <p className="mt-3 text-sm text-slate-500">The verified authority must define the fee, royalty basis, and complete beneficiary split.</p>}{message && <p className="mt-3 text-sm text-slate-700">{message}</p>}</section>;
+  if (!settlement) return <section className="mt-4 rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="font-medium text-slate-950">Settlement ledger</h3><button type="button" disabled={financialBusy || loading} onClick={() => void load().catch(() => setMessage("Could not refresh the ledger. Try again."))} className="mt-2 text-sm font-medium text-blue-700 underline disabled:opacity-40">Refresh ledger</button><p className="mt-1 text-sm text-slate-600">A reserve or proposed fee is provisional. It never grants permission.</p></div><Badge tone="amber">not configured</Badge></div>{inbound ? <details className="mt-3"><summary className="cursor-pointer text-sm font-medium text-blue-800">Define immutable settlement terms</summary><form onSubmit={createTerms} className="mt-3 space-y-3 rounded-xl bg-slate-50 p-4"><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><label className="text-sm">Currency<input required maxLength={3} value={currency} onChange={(event) => setCurrency(event.target.value.toUpperCase())} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" /></label><label className="text-sm">Minimum · minor units<input required type="number" min="0" value={minimumMinor} onChange={(event) => setMinimumMinor(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" /></label><label className="text-sm">Royalty rate · basis points<input required type="number" min="0" max="10000" value={royaltyRateBps} onChange={(event) => setRoyaltyRateBps(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" /></label><label className="text-sm">Royalty basis<select value={royaltyBasis} onChange={(event) => setRoyaltyBasis(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"><option value="net_revenue">Net revenue</option><option value="gross_revenue">Gross revenue</option><option value="net_receipts">Net receipts</option></select></label></div><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={minimumRecoupable} onChange={(event) => setMinimumRecoupable(event.target.checked)} />Minimum is recoupable against royalties</label><fieldset><legend className="text-sm font-medium">Beneficiaries · shares must total 10,000 bps</legend><div className="mt-2 space-y-2">{beneficiaryDrafts.map((row, index) => <div key={index} className="grid gap-2 sm:grid-cols-[1fr_1fr_10rem_auto]"><input required aria-label={`Beneficiary ${index + 1} name`} value={row.name} onChange={(event) => updateBeneficiary(index, "name", event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Artist or owner" /><input required aria-label={`Beneficiary ${index + 1} identifier`} value={row.identifier} onChange={(event) => updateBeneficiary(index, "identifier", event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="IPI, party ID, or contract ID" /><input required aria-label={`Beneficiary ${index + 1} share`} type="number" min="1" max="10000" value={row.shareBps} onChange={(event) => updateBeneficiary(index, "shareBps", event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Share bps" /><button type="button" disabled={beneficiaryDrafts.length === 1} onClick={() => setBeneficiaryDrafts((current) => current.filter((_, rowIndex) => rowIndex !== index))} className="rounded-lg border border-slate-300 px-3 py-2 text-sm disabled:opacity-40">Remove</button></div>)}</div><button type="button" onClick={() => setBeneficiaryDrafts((current) => [...current, { name: "", identifier: "", shareBps: "" }])} className="mt-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">Add beneficiary</button></fieldset><label className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-slate-700"><input required type="checkbox" checked={termsConfirmed} onChange={(event) => setTermsConfirmed(event.target.checked)} className="mt-1" />I reviewed the currency, minimum, royalty basis, and complete split. These terms cannot be edited; a correction requires a replacement permission.</label><button disabled={financialBusy || !termsConfirmed} className="rounded-lg bg-blue-700 px-4 py-2 text-sm font-medium text-white disabled:opacity-40">Record settlement terms</button></form></details> : <p className="mt-3 text-sm text-slate-500">The verified authority must define the fee, royalty basis, and complete beneficiary split.</p>}{message && <p className="mt-3 text-sm text-slate-700">{message}</p>}</section>;
 
   const authorityEntryKinds = ["payment_received", "payment_reversal", "payout", "payout_reversal", "royalty_adjustment_increase", "royalty_adjustment_decrease"];
   const entryKinds = inbound ? authorityEntryKinds : ["reserve", "reserve_release"];
   const latestReconciliation = settlement.reconciliations[settlement.reconciliations.length - 1];
-  return <section className="mt-4 rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="font-medium text-slate-950">Settlement ledger</h3><p className="mt-1 text-sm text-slate-600">{settlement.minimumCommitmentMinor.toLocaleString()} {settlement.currency} minor-unit minimum · {(settlement.royaltyRateBps / 100).toLocaleString()}% of {humanize(settlement.royaltyBasis)}</p></div><Badge tone={settlement.assertionType === "paid" ? "green" : "amber"}>{settlement.assertionType}</Badge></div><dl className="mt-4 grid gap-3 sm:grid-cols-5">{[["Reserved", settlement.totals.reserveMinor], ["Royalty", settlement.totals.royaltyAccruedMinor], ["Obligation", settlement.totals.obligationMinor], ["Payment", settlement.totals.paymentReceivedMinor], ["Payouts", settlement.totals.payoutMinor]].map(([label, amount]) => <div key={String(label)}><dt className="text-xs uppercase tracking-wide text-slate-500">{label}</dt><dd className="font-medium text-slate-900">{Number(amount).toLocaleString()} <span className="text-xs font-normal text-slate-500">{settlement.currency} minor</span></dd></div>)}</dl><div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead className="text-xs uppercase text-slate-500"><tr><th className="py-2">Beneficiary</th><th>Share</th><th>Owed</th><th>Paid out</th><th>Variance</th></tr></thead><tbody>{settlement.totals.beneficiaries.map((row) => <tr key={row.beneficiaryId} className="border-t border-slate-100"><td className="py-2">{row.name}<span className="ml-1 text-xs text-slate-500">{row.identifier}</span></td><td>{row.shareBps / 100}%</td><td>{row.obligationMinor.toLocaleString()}</td><td>{row.payoutMinor.toLocaleString()}</td><td className={row.varianceMinor === 0 ? "text-emerald-700" : "text-amber-700"}>{row.varianceMinor.toLocaleString()}</td></tr>)}</tbody></table></div><p className="mt-3 break-all text-xs text-slate-500">Ledger SHA-256 {settlement.ledgerDigest}{latestReconciliation ? ` · latest reconciliation ${latestReconciliation.status}${settlement.reconciliationCurrent ? "" : " (stale after later entries)"}` : " · not reconciled"}</p>{latestReconciliation && <div className="mt-3 flex flex-wrap gap-2"><button onClick={() => inspectReconciliation(latestReconciliation.receiptId)} className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-900">Verify reconciliation receipt</button><a target="_blank" rel="noreferrer" href={`${API_BASE}/v1/receipts/${latestReconciliation.receiptId}`} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-medium">Raw reconciliation JSON</a></div>}{latestReconciliation && reconciliationInspections[latestReconciliation.receiptId] && <ReceiptVerification inspection={reconciliationInspections[latestReconciliation.receiptId]} />}{entryKinds.length > 0 && <details className="mt-4 rounded-xl bg-slate-50 p-3"><summary className="cursor-pointer text-sm font-medium">Append financial evidence</summary><p className="mt-2 text-xs text-slate-600">Amounts use currency minor units. External references identify bank records, statements, or payout evidence; secrets do not belong here.</p>{inbound && permission.receiptId && <form onSubmit={calculateRoyalty} className="mt-3 grid gap-2 rounded-lg border border-slate-200 bg-white p-3 sm:grid-cols-2 lg:grid-cols-5"><input required type="number" min="1" aria-label="Royalty basis amount" value={basisAmount} onChange={(event) => setBasisAmount(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Revenue · minor units" /><input required aria-label="Royalty period start" value={periodStart} onChange={(event) => setPeriodStart(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Period start YYYY-MM-DD" /><input required aria-label="Royalty period end" value={periodEnd} onChange={(event) => setPeriodEnd(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Period end YYYY-MM-DD" /><input required aria-label="Royalty statement reference" value={statementReference} onChange={(event) => setStatementReference(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Statement evidence reference" /><button className="rounded-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white">Calculate royalty</button></form>}<form onSubmit={appendEntry} className="mt-3 grid gap-2 rounded-lg border border-slate-200 bg-white p-3 sm:grid-cols-2 lg:grid-cols-6"><select value={entryKind} onChange={(event) => setEntryKind(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2">{entryKinds.map((kind) => <option key={kind} value={kind}>{humanize(kind)}</option>)}</select><input required type="number" min="1" aria-label="Financial entry amount" value={entryAmount} onChange={(event) => setEntryAmount(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Amount · minor units" />{["payout", "payout_reversal"].includes(entryKind) ? <select required aria-label="Payout beneficiary" value={entryBeneficiary} onChange={(event) => setEntryBeneficiary(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2"><option value="">Select beneficiary</option>{settlement.beneficiaries.map((row) => <option key={row.id} value={row.id}>{row.name} · {row.identifier}</option>)}</select> : <span className="hidden lg:block" />}<input required={entryKind !== "reserve"} aria-label="External financial reference" value={externalReference} onChange={(event) => setExternalReference(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="External transaction reference" /><input required={entryKind !== "reserve"} aria-label="Financial evidence reference" value={evidenceReference} onChange={(event) => setEvidenceReference(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Evidence digest or record ID" /><button className="rounded-lg bg-slate-950 px-3 py-2 text-sm font-medium text-white">Append entry</button></form></details>}{inbound && permission.receiptId && <div className="mt-4 flex flex-wrap items-center gap-2"><input value={reconciliationNote} onChange={(event) => setReconciliationNote(event.target.value)} className="min-w-72 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Reconciliation review note · optional" /><button onClick={reconcile} className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white">Reconcile current ledger</button></div>}{settlement.entries.length > 0 && <details className="mt-4"><summary className="cursor-pointer text-xs font-medium text-slate-600">Immutable entry history · {settlement.entries.length}</summary><div className="mt-2 space-y-2">{settlement.entries.map((entry) => <div key={entry.id} className="flex flex-wrap justify-between gap-2 rounded-lg bg-slate-50 p-2 text-xs"><span>{humanize(entry.kind)} · {entry.amountMinor.toLocaleString()} {settlement.currency}{entry.periodStart ? ` · ${entry.periodStart} to ${entry.periodEnd}` : ""}</span><span className="text-slate-500">{entry.externalReference || "internal reserve"} · {formatTimestamp(entry.createdAt)}</span></div>)}</div></details>}{message && <p className="mt-3 text-sm text-slate-700">{message}</p>}</section>;
+  return <section className="mt-4 rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 className="font-medium text-slate-950">Settlement ledger</h3><button type="button" disabled={financialBusy || loading} onClick={() => void load().catch(() => setMessage("Could not refresh the ledger. Try again."))} className="mt-2 text-sm font-medium text-blue-700 underline disabled:opacity-40">Refresh ledger</button><p className="mt-1 text-sm text-slate-600">{settlement.minimumCommitmentMinor.toLocaleString()} {settlement.currency} minor-unit minimum · {(settlement.royaltyRateBps / 100).toLocaleString()}% of {humanize(settlement.royaltyBasis)}</p></div><Badge tone={settlement.assertionType === "paid" ? "green" : "amber"}>{settlement.assertionType}</Badge></div><dl className="mt-4 grid gap-3 sm:grid-cols-5">{[["Reserved", settlement.totals.reserveMinor], ["Royalty", settlement.totals.royaltyAccruedMinor], ["Obligation", settlement.totals.obligationMinor], ["Payment", settlement.totals.paymentReceivedMinor], ["Payouts", settlement.totals.payoutMinor]].map(([label, amount]) => <div key={String(label)}><dt className="text-xs uppercase tracking-wide text-slate-500">{label}</dt><dd className="font-medium text-slate-900">{Number(amount).toLocaleString()} <span className="text-xs font-normal text-slate-500">{settlement.currency} minor</span></dd></div>)}</dl><div className="mt-4 overflow-x-auto"><table className="w-full text-left text-sm"><thead className="text-xs uppercase text-slate-500"><tr><th className="py-2">Beneficiary</th><th>Share</th><th>Owed</th><th>Paid out</th><th>Variance</th></tr></thead><tbody>{settlement.totals.beneficiaries.map((row) => <tr key={row.beneficiaryId} className="border-t border-slate-100"><td className="py-2">{row.name}<span className="ml-1 text-xs text-slate-500">{row.identifier}</span></td><td>{row.shareBps / 100}%</td><td>{row.obligationMinor.toLocaleString()}</td><td>{row.payoutMinor.toLocaleString()}</td><td className={row.varianceMinor === 0 ? "text-emerald-700" : "text-amber-700"}>{row.varianceMinor.toLocaleString()}</td></tr>)}</tbody></table></div><p className="mt-3 break-all text-xs text-slate-500">Ledger SHA-256 {settlement.ledgerDigest}{latestReconciliation ? ` · latest reconciliation ${latestReconciliation.status}${settlement.reconciliationCurrent ? "" : " (stale after later entries)"}` : " · not reconciled"}</p>{latestReconciliation && <div className="mt-3 flex flex-wrap gap-2"><button onClick={() => inspectReconciliation(latestReconciliation.receiptId)} className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-900">Verify reconciliation receipt</button><button type="button" onClick={() => void downloadReconciliation(latestReconciliation.receiptId)} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-medium">Download reconciliation receipt</button></div>}{latestReconciliation && reconciliationInspections[latestReconciliation.receiptId] && <ReceiptVerification inspection={reconciliationInspections[latestReconciliation.receiptId]} />}{entryKinds.length > 0 && <details className="mt-4 rounded-xl bg-slate-50 p-3"><summary className="cursor-pointer text-sm font-medium">Append financial evidence</summary><p className="mt-2 text-xs text-slate-600">Amounts use currency minor units. External references identify bank records, statements, or payout evidence; secrets do not belong here.</p>{inbound && permission.receiptId && <form onSubmit={calculateRoyalty} className="mt-3 grid gap-2 rounded-lg border border-slate-200 bg-white p-3 sm:grid-cols-2 lg:grid-cols-5"><input required type="number" min="1" aria-label="Royalty basis amount" value={basisAmount} onChange={(event) => setBasisAmount(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Revenue · minor units" /><input required aria-label="Royalty period start" value={periodStart} onChange={(event) => setPeriodStart(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Period start YYYY-MM-DD" /><input required aria-label="Royalty period end" value={periodEnd} onChange={(event) => setPeriodEnd(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Period end YYYY-MM-DD" /><input required aria-label="Royalty statement reference" value={statementReference} onChange={(event) => setStatementReference(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Statement evidence reference" /><button disabled={financialBusy} className="rounded-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Calculate royalty</button></form>}<form onSubmit={appendEntry} className="mt-3 grid gap-2 rounded-lg border border-slate-200 bg-white p-3 sm:grid-cols-2 lg:grid-cols-6"><select value={entryKind} onChange={(event) => setEntryKind(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2">{entryKinds.map((kind) => <option key={kind} value={kind}>{humanize(kind)}</option>)}</select><input required type="number" min="1" aria-label="Financial entry amount" value={entryAmount} onChange={(event) => setEntryAmount(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Amount · minor units" />{["payout", "payout_reversal"].includes(entryKind) ? <select required aria-label="Payout beneficiary" value={entryBeneficiary} onChange={(event) => setEntryBeneficiary(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2"><option value="">Select beneficiary</option>{settlement.beneficiaries.map((row) => <option key={row.id} value={row.id}>{row.name} · {row.identifier}</option>)}</select> : <span className="hidden lg:block" />}<input required={entryKind !== "reserve"} aria-label="External financial reference" value={externalReference} onChange={(event) => setExternalReference(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="External transaction reference" /><input required={entryKind !== "reserve"} aria-label="Financial evidence reference" value={evidenceReference} onChange={(event) => setEvidenceReference(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2" placeholder="Evidence digest or record ID" /><button disabled={financialBusy} className="rounded-lg bg-slate-950 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Append entry</button></form></details>}{inbound && permission.receiptId && <div className="mt-4 flex flex-wrap items-center gap-2"><input value={reconciliationNote} onChange={(event) => setReconciliationNote(event.target.value)} className="min-w-72 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" placeholder="Reconciliation review note · optional" /><button disabled={financialBusy} onClick={reconcile} className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white">Reconcile current ledger</button></div>}{settlement.entries.length > 0 && <details className="mt-4"><summary className="cursor-pointer text-xs font-medium text-slate-600">Immutable entry history · {settlement.entries.length}</summary><div className="mt-2 space-y-2">{settlement.entries.map((entry) => <div key={entry.id} className="flex flex-wrap justify-between gap-2 rounded-lg bg-slate-50 p-2 text-xs"><span>{humanize(entry.kind)} · {entry.amountMinor.toLocaleString()} {settlement.currency}{entry.periodStart ? ` · ${entry.periodStart} to ${entry.periodEnd}` : ""}</span><span className="text-slate-500">{entry.externalReference || "internal reserve"} · {formatTimestamp(entry.createdAt)}</span></div>)}</div></details>}{message && <p className="mt-3 text-sm text-slate-700">{message}</p>}</section>;
 }
 
 
 function SettlementLedger({ session, permission }: { session: SessionCredential; permission: Permission }) {
-  return <><DdexMwlExport session={session} permission={permission} /><SettlementLedgerCore session={session} permission={permission} /></>;
+  return <><DdexMwlExport session={session} permission={permission} /><SettlementLedgerCore key={`${session.id}:${permission.id}`} session={session} permission={permission} /></>;
 }
 
 
@@ -1504,10 +1679,15 @@ function Permissions({ session, organization }: { session: SessionCredential; or
   React.useEffect(() => void load().catch((error) => setMessage(error.message)), [load]);
   async function inspectReceipt(receiptId: string) {
     try {
-      const receipt = await api<Record<string, any>>(`/v1/receipts/${receiptId}`);
+      const receipt = await api<Record<string, any>>(`/v1/receipts/${receiptId}`, session);
       const verification = await api<ReceiptInspection["verification"]>("/v1/receipts/verify", undefined, { method: "POST", body: JSON.stringify({ receipt }) });
       setReceiptInspections((current) => ({ ...current, [receiptId]: { receipt, verification } }));
     } catch (error) { setMessage(error instanceof Error ? error.message : "Receipt verification failed."); }
+  }
+  async function downloadReceipt(receiptId: string) {
+    try {
+      await downloadPrivateReceipt(receiptId, session);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Receipt download failed."); }
   }
   async function recordLifecycle(permissionId: string, eventType: "dispute" | "revocation" | "correction") {
     const reason = (lifecycleReasons[permissionId] || "").trim();
@@ -1530,7 +1710,7 @@ function Permissions({ session, organization }: { session: SessionCredential; or
     const authorityCanChangeStatus = permission.directions.includes("inbound") && ["approved", "disputed"].includes(permission.status);
     const partyCanDispute = permission.status === "approved";
     const statusTone = permission.status === "approved" ? "green" : ["rejected", "revoked"].includes(permission.status) ? "red" : permission.status === "corrected" ? "blue" : "amber";
-    return <article key={permission.id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><strong>{permission.workTitle || permission.workKey}</strong><p className="text-sm text-slate-600">{humanize(permission.intendedUsage)} · {permission.territory} · {permission.workKey}</p></div><div className="flex gap-2">{permission.directions.map((direction) => <Badge key={direction} tone="blue">{direction}</Badge>)}<Badge tone={statusTone}>{permission.status}</Badge></div></div><p className="mt-3 text-xs text-slate-500">Requester: {permission.requester.organizationName} · Authority: {permission.authority.organizationName} ({permission.authority.rightType})</p><PermissionScope permission={permission} />{permission.decisionNote && <p className="mt-2 text-sm text-slate-700">{permission.decisionNote}</p>}{permission.status === "pending" && permission.directions.includes("inbound") && <AssignmentAndDecision session={session} permission={permission} members={members} onChanged={load} />}<div className="mt-3 flex flex-wrap gap-2">{permission.receiptId && <><button onClick={() => inspectReceipt(permission.receiptId!)} className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-900">Verify grant receipt</button><a target="_blank" rel="noreferrer" href={`${API_BASE}/v1/receipts/${permission.receiptId}`} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Raw grant JSON</a></>}</div>{permission.receiptId && receiptInspections[permission.receiptId] && <ReceiptVerification inspection={receiptInspections[permission.receiptId]} />}<LicenseObligationsSummary permission={permission} /><PermissionCompliance session={session} permission={permission} onChanged={load} /><SettlementLedger session={session} permission={permission} />{(permission.lifecycleRecords || []).length > 0 && <section className="mt-4 rounded-xl border border-slate-200 p-3"><h3 className="text-sm font-medium text-slate-900">Signed status history</h3><div className="mt-2 space-y-2">{permission.lifecycleRecords!.map((record) => <div key={record.receiptId} className="rounded-lg bg-slate-50 p-3 text-sm"><div className="flex flex-wrap items-center justify-between gap-2"><div><Badge tone={record.status === "revoked" ? "red" : record.status === "corrected" ? "blue" : "amber"}>{record.status}</Badge><span className="ml-2">{record.reason}</span></div><button onClick={() => inspectReceipt(record.receiptId)} className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium">Verify {humanize(record.eventType)} receipt</button></div>{record.replacementReceiptId && <p className="mt-2 break-all text-xs text-slate-500">Replacement grant: {record.replacementReceiptId}</p>}{receiptInspections[record.receiptId] && <ReceiptVerification inspection={receiptInspections[record.receiptId]} />}</div>)}</div></section>}{(partyCanDispute || authorityCanChangeStatus) && <details className="mt-4 rounded-xl border border-amber-200 bg-amber-50/50 p-3"><summary className="cursor-pointer text-sm font-medium text-slate-900">Dispute, revoke, or correct this grant</summary><p className="mt-2 text-xs text-slate-600">The original receipt remains valid as historical evidence. This action creates a new signed record linked to it.</p><textarea aria-label={`Status change reason for ${permission.workKey}`} value={lifecycleReasons[permission.id] || ""} onChange={(event) => setLifecycleReasons((current) => ({ ...current, [permission.id]: event.target.value }))} className="mt-3 min-h-20 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="State the concrete reason and relevant evidence." />{authorityCanChangeStatus && <input aria-label={`Replacement receipt for ${permission.workKey}`} value={replacementReceiptIds[permission.id] || ""} onChange={(event) => setReplacementReceiptIds((current) => ({ ...current, [permission.id]: event.target.value }))} className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="Replacement grant receipt ID · required only for correction" />}<div className="mt-3 flex flex-wrap gap-2">{partyCanDispute && <button disabled={!reason} onClick={() => recordLifecycle(permission.id, "dispute")} className="rounded-lg border border-amber-400 bg-white px-3 py-2 text-sm font-medium disabled:opacity-40">Open dispute</button>}{authorityCanChangeStatus && <><button disabled={!reason} onClick={() => recordLifecycle(permission.id, "revocation")} className="rounded-lg bg-red-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Revoke grant</button><button disabled={!reason || !(replacementReceiptIds[permission.id] || "").trim()} onClick={() => recordLifecycle(permission.id, "correction")} className="rounded-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Record correction</button></>}</div></details>}</article>;
+    return <article key={permission.id} className="rounded-xl border border-slate-200 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><strong>{permission.workTitle || permission.workKey}</strong><p className="text-sm text-slate-600">{humanize(permission.intendedUsage)} · {permission.territory} · {permission.workKey}</p></div><div className="flex gap-2">{permission.directions.map((direction) => <Badge key={direction} tone="blue">{direction}</Badge>)}<Badge tone={statusTone}>{permission.status}</Badge></div></div><p className="mt-3 text-xs text-slate-500">Requester: {permission.requester.organizationName} · Authority: {permission.authority.organizationName} ({permission.authority.rightType})</p><PermissionScope permission={permission} />{permission.decisionNote && <p className="mt-2 text-sm text-slate-700">{permission.decisionNote}</p>}{permission.status === "pending" && permission.directions.includes("inbound") && <AssignmentAndDecision session={session} permission={permission} members={members} onChanged={load} />}<div className="mt-3 flex flex-wrap gap-2">{permission.receiptId && <><button onClick={() => inspectReceipt(permission.receiptId!)} className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-900">Verify grant receipt</button><button onClick={() => downloadReceipt(permission.receiptId!)} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium">Download grant JSON</button></>}</div>{permission.receiptId && receiptInspections[permission.receiptId] && <ReceiptVerification inspection={receiptInspections[permission.receiptId]} />}<LicenseObligationsSummary permission={permission} /><PermissionCompliance session={session} permission={permission} onChanged={load} /><SettlementLedger session={session} permission={permission} />{(permission.lifecycleRecords || []).length > 0 && <section className="mt-4 rounded-xl border border-slate-200 p-3"><h3 className="text-sm font-medium text-slate-900">Signed status history</h3><div className="mt-2 space-y-2">{permission.lifecycleRecords!.map((record) => <div key={record.receiptId} className="rounded-lg bg-slate-50 p-3 text-sm"><div className="flex flex-wrap items-center justify-between gap-2"><div><Badge tone={record.status === "revoked" ? "red" : record.status === "corrected" ? "blue" : "amber"}>{record.status}</Badge><span className="ml-2">{record.reason}</span></div><button onClick={() => inspectReceipt(record.receiptId)} className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium">Verify {humanize(record.eventType)} receipt</button></div>{record.replacementReceiptId && <p className="mt-2 break-all text-xs text-slate-500">Replacement grant: {record.replacementReceiptId}</p>}{receiptInspections[record.receiptId] && <ReceiptVerification inspection={receiptInspections[record.receiptId]} />}</div>)}</div></section>}{(partyCanDispute || authorityCanChangeStatus) && <details className="mt-4 rounded-xl border border-amber-200 bg-amber-50/50 p-3"><summary className="cursor-pointer text-sm font-medium text-slate-900">Dispute, revoke, or correct this grant</summary><p className="mt-2 text-xs text-slate-600">The original receipt remains valid as historical evidence. This action creates a new signed record linked to it.</p><textarea aria-label={`Status change reason for ${permission.workKey}`} value={lifecycleReasons[permission.id] || ""} onChange={(event) => setLifecycleReasons((current) => ({ ...current, [permission.id]: event.target.value }))} className="mt-3 min-h-20 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="State the concrete reason and relevant evidence." />{authorityCanChangeStatus && <input aria-label={`Replacement receipt for ${permission.workKey}`} value={replacementReceiptIds[permission.id] || ""} onChange={(event) => setReplacementReceiptIds((current) => ({ ...current, [permission.id]: event.target.value }))} className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="Replacement grant receipt ID · required only for correction" />}<div className="mt-3 flex flex-wrap gap-2">{partyCanDispute && <button disabled={!reason} onClick={() => recordLifecycle(permission.id, "dispute")} className="rounded-lg border border-amber-400 bg-white px-3 py-2 text-sm font-medium disabled:opacity-40">Open dispute</button>}{authorityCanChangeStatus && <><button disabled={!reason} onClick={() => recordLifecycle(permission.id, "revocation")} className="rounded-lg bg-red-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Revoke grant</button><button disabled={!reason || !(replacementReceiptIds[permission.id] || "").trim()} onClick={() => recordLifecycle(permission.id, "correction")} className="rounded-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40">Record correction</button></>}</div></details>}</article>;
   })}{message && <p className="text-sm text-slate-600">{message}</p>}</div></Panel>;
 }
 
@@ -1737,16 +1917,21 @@ function OperatorReview({ session }: { session: SessionCredential }) {
 }
 
 function OperatorOnlyConsole({ context, session, onSignOut, nodeInfo }: { context: SessionContext; session: SessionCredential; onSignOut: () => void; nodeInfo: NodeInfo | null }) {
-  return <div className="min-h-screen bg-slate-50"><DeploymentBanner nodeInfo={nodeInfo} /><header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-6 py-4"><div><div className="text-xl font-semibold text-slate-950">Clef Rights Node</div><div className="text-xs text-slate-500">Node operations · evidence verification</div></div><div className="flex items-center gap-3"><span className="text-sm text-slate-600">{context.user.email}</span><button onClick={onSignOut} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">Sign out</button></div></div></header><main className="mx-auto max-w-7xl space-y-6 px-6 py-8"><div className="mb-6"><Badge tone="blue">Node operator</Badge><p className="mt-2 max-w-2xl text-sm text-slate-600">Review evidence independently. An operator account does not need to create or join a rights-holding organization.</p></div><OperatorReview session={session} /><OperatorAudit session={session} /></main><LegalNotice nodeInfo={nodeInfo}>Verification records the evidence review performed by this node. It does not create ownership, expand a claimant&apos;s rights, or provide legal advice.</LegalNotice></div>;
+  return <div className="min-h-screen bg-slate-50"><DeploymentBanner nodeInfo={nodeInfo} /><header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-6 py-4"><div><div className="text-xl font-semibold text-slate-950">Clef Rights Node</div><div className="text-xs text-slate-500">Node operations · evidence verification</div></div><div className="flex items-center gap-3"><span className="text-sm text-slate-600">{context.user.email}</span><button onClick={onSignOut} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">Sign out</button></div></div></header><main className="mx-auto max-w-7xl space-y-6 px-6 py-8"><div className="mb-6"><Badge tone="blue">Node operator</Badge><p className="mt-2 max-w-2xl text-sm text-slate-600">Review evidence independently. An operator account does not need to create or join a rights-holding organization.</p></div><DeploymentReadinessPanel apiBase={API_BASE} sessionId={session.id} sourceCodeUrl={nodeInfo?.sourceCodeUrl} /><OperatorReview session={session} /><OperatorAudit session={session} /></main><LegalNotice nodeInfo={nodeInfo}>Verification records the evidence review performed by this node. It does not create ownership, expand a claimant&apos;s rights, or provide legal advice.</LegalNotice></div>;
 }
 
 export function RightsNodeApp() {
   const [credential, setCredential] = React.useState<SessionCredential | null>(() => readSession());
+  const credentialRef = React.useRef(credential?.id);
+  credentialRef.current = credential?.id;
+  const navigationGeneration = React.useRef(0);
+  const [showConsole, setShowConsole] = React.useState(false);
+  const [showSetup, setShowSetup] = React.useState(false);
   const [nodeInfo, setNodeInfo] = React.useState<NodeInfo | null>(null);
   const [context, setContext] = React.useState<SessionContext | null>(null);
   const [loading, setLoading] = React.useState(Boolean(credential));
   const [error, setError] = React.useState("");
-  const [tab, setTab] = React.useState<"catalog" | "policies" | "authority" | "request" | "permissions" | "team" | "operations" | "operator">("catalog");
+  const [tab, setTab] = React.useState<"catalog" | "policies" | "authority" | "request" | "permissions" | "team" | "operations" | "operator" | "connected">("catalog");
   const [activeOrgId, setActiveOrgId] = React.useState(() => safeStorageGet("session", ORG_KEY) || "");
 
   React.useEffect(() => {
@@ -1762,6 +1947,7 @@ export function RightsNodeApp() {
     setLoading(true);
     try {
       const data = await api<SessionContext>("/v1/session", credential);
+      if (credentialRef.current !== credential.id) return;
       setContext(data);
       setError("");
       if (!data.organizations.some((organization) => organization.id === activeOrgId)) {
@@ -1770,26 +1956,63 @@ export function RightsNodeApp() {
         if (next) safeStorageSet("session", ORG_KEY, next);
       }
     } catch (caught) {
+      if (credentialRef.current !== credential.id) return;
       if (caught instanceof ApiError && caught.status === 401) {
         safeStorageRemove("session", SESSION_KEY); setCredential(null); setContext(null);
       } else setError(caught instanceof Error ? caught.message : "Could not load session.");
-    } finally { setLoading(false); }
+    } finally { if (credentialRef.current === credential.id) setLoading(false); }
   }, [activeOrgId, credential]);
   React.useEffect(() => void refresh(), [refresh]);
 
-  const authenticate = React.useCallback((session: SessionCredential) => { setCredential(session); setLoading(true); }, []);
+  const authenticate = React.useCallback((session: SessionCredential) => {
+    navigationGeneration.current++;
+    credentialRef.current = session.id; setContext(null); setCredential(session); setLoading(true);
+    setShowConsole(false); setShowSetup(false); setError("");
+  }, []);
   async function signOut() {
-    if (credential) await api("/auth/session", credential, { method: "DELETE" }).catch(() => undefined);
-    safeStorageRemove("session", SESSION_KEY); safeStorageRemove("session", ORG_KEY); setCredential(null); setContext(null); setActiveOrgId("");
+    const previous = credential;
+    navigationGeneration.current++;
+    credentialRef.current = undefined;
+    safeStorageRemove("session", SESSION_KEY); safeStorageRemove("session", ORG_KEY);
+    setCredential(null); setContext(null); setActiveOrgId(""); setShowConsole(false); setShowSetup(false);
+    if (previous) await api("/auth/session", previous, { method: "DELETE" }).catch(() => undefined);
+  }
+  async function restartTour() {
+    const response = await api<{ session: SessionCredential }>("/v1/sandbox/session", undefined, { method: "POST" });
+    const previous = credential;
+    safeStorageSet("session", SESSION_KEY, JSON.stringify(response.session));
+    safeStorageRemove("session", ORG_KEY); setActiveOrgId(""); authenticate(response.session);
+    if (previous) await api("/auth/session", previous, { method: "DELETE" }).catch(() => undefined);
+  }
+  async function openConsole(orgId: string, destination: "catalog" | "policies" | "permissions" | "connected") {
+    if (!credential) return;
+    const generation = ++navigationGeneration.current;
+    try {
+      const data = await api<SessionContext>("/v1/session", credential);
+      if (credentialRef.current !== credential.id || generation !== navigationGeneration.current) return;
+      setContext(data); setActiveOrgId(orgId); safeStorageSet("session", ORG_KEY, orgId);
+      setTab(destination); setShowConsole(true); setShowSetup(false);
+    } catch (caught) {
+      if (credentialRef.current === credential.id && generation === navigationGeneration.current)
+        setError(caught instanceof Error ? caught.message : "Could not open the console.");
+    }
   }
   if (!credential) return <SignIn onAuthenticated={authenticate} nodeInfo={nodeInfo} />;
   if (loading && !context) return <div className="grid min-h-screen place-items-center text-slate-600">Loading secure session…</div>;
   if (!context) return <div className="mx-auto max-w-xl p-8 text-red-700">{error || "Session unavailable."}</div>;
-  if (requiresOrganizationSetup(context)) return <div className="min-h-screen bg-slate-50"><DeploymentBanner nodeInfo={nodeInfo} /><OrganizationSetup session={credential} onCreated={refresh} /><LegalNotice nodeInfo={nodeInfo} /></div>;
+  const tourAvailable = isPublicSandbox(nodeInfo) && Boolean(nodeInfo?.sandboxGuestAccess) && context.user.email.endsWith("@sandbox.invalid");
+  if (tourAvailable && !showConsole && !showSetup) return <><SandboxTour key={credential.id} session={credential}
+    federationEnabled={nodeInfo?.federationEnabled}
+    onConsole={(orgId, destination) => void openConsole(orgId, destination)}
+    onSetup={() => { navigationGeneration.current++; setError(""); setShowSetup(true); setShowConsole(true); }} onSignOut={signOut} onRestart={restartTour}
+    onDownload={(receiptId) => downloadPrivateReceipt(receiptId, credential)} /><LegalNotice nodeInfo={nodeInfo} />{error && <p role="alert" className="p-4 text-red-700">{error}</p>}</>;
+  if (showSetup || requiresOrganizationSetup(context)) return <div className="min-h-screen bg-slate-50"><DeploymentBanner nodeInfo={nodeInfo} />{tourAvailable && <button className="m-6 text-blue-700 underline" onClick={() => { setShowSetup(false); setShowConsole(false); }}>← Return to the example catalog</button>}<OrganizationSetup session={credential} onCreated={() => { setShowSetup(false); void refresh(); }} /><LegalNotice nodeInfo={nodeInfo} /></div>;
   if (context.organizations.length === 0) return <OperatorOnlyConsole context={context} session={credential} onSignOut={signOut} nodeInfo={nodeInfo} />;
   const active = context.organizations.find((organization) => organization.id === activeOrgId) || context.organizations[0];
   const canManageRights = canOrganizationManageRights(active);
-  const tabs = [...(canManageRights ? [{ id: "catalog" as const, label: "Catalog" }, { id: "policies" as const, label: "Policies" }, { id: "authority" as const, label: "Authority" }] : []), { id: "request" as const, label: "Request permission" }, { id: "permissions" as const, label: "Permission ledger" }, { id: "team" as const, label: "Team" }, { id: "operations" as const, label: "Operations" }, ...(context.user.nodeRole === "admin" ? [{ id: "operator" as const, label: "Operator review" }] : [])] as const;
+  const canAdministerSetup = ORG_DECISION_ROLES.has(active.role);
+  const canAdministerPrivacy = isPrivacyAdministrator(active.role);
+  const tabs = [...(nodeInfo?.federationEnabled ? [{ id: "connected" as const, label: "Connected catalogs" }] : []), ...(canManageRights ? [{ id: "catalog" as const, label: "Catalog" }, { id: "policies" as const, label: "Policies" }, { id: "authority" as const, label: "Authority" }] : []), { id: "request" as const, label: "Request permission" }, { id: "permissions" as const, label: "Permission ledger" }, { id: "team" as const, label: "Team" }, { id: "operations" as const, label: "Operations" }, ...(context.user.nodeRole === "admin" ? [{ id: "operator" as const, label: "Operator review" }] : [])] as const;
   const visibleTab = !canManageRights && (tab === "catalog" || tab === "policies" || tab === "authority") ? "request" : tab;
-  return <div className="min-h-screen bg-slate-50"><DeploymentBanner nodeInfo={nodeInfo} /><header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-6 py-4"><div><div className="text-xl font-semibold text-slate-950">Clef Rights Node</div><div className="text-xs text-slate-500">Catalog → evidence → versioned policy → scoped decision → signed receipt</div></div><div className="flex items-center gap-3"><select value={active.id} onChange={(event) => { setActiveOrgId(event.target.value); safeStorageSet("session", ORG_KEY, event.target.value); }} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">{context.organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name} · {organization.role}</option>)}</select><span className="hidden text-sm text-slate-600 sm:inline">{context.user.email}</span><button onClick={signOut} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">Sign out</button></div></div></header><main className="mx-auto max-w-7xl px-6 py-8"><div className="mb-6 flex flex-wrap gap-2">{tabs.map((item) => <button key={item.id} onClick={() => setTab(item.id)} className={`rounded-xl px-4 py-2 text-sm font-medium ${visibleTab === item.id ? "bg-slate-950 text-white" : "bg-white text-slate-700 shadow-sm"}`}>{item.label}</button>)}</div>{error && <div className="mb-4 rounded-xl bg-red-50 p-3 text-sm text-red-800">{error}</div>}{visibleTab === "catalog" && <Catalog session={credential} organization={active} />}{visibleTab === "policies" && <Policies key={policyEditorScopeKey(active.id)} session={credential} organization={active} />}{visibleTab === "authority" && <Authority session={credential} organization={active} />}{visibleTab === "request" && <RequestPermission session={credential} organization={active} />}{visibleTab === "permissions" && <Permissions session={credential} organization={active} />}{visibleTab === "team" && <Team session={credential} organization={active} />}{visibleTab === "operations" && <Operations session={credential} organization={active} />}{visibleTab === "operator" && <div className="space-y-6"><OperatorReview session={credential} /><OperatorAudit session={credential} /></div>}</main><LegalNotice nodeInfo={nodeInfo}>Clef records evidence, policy versions, and decisions. A receipt proves what this node recorded; it cannot replace rights the claimant did not control or legal advice.</LegalNotice></div>;
+  return <div className="min-h-screen bg-slate-50"><DeploymentBanner nodeInfo={nodeInfo} /><header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-6 py-4"><div><div className="text-xl font-semibold text-slate-950">Clef Rights Node</div><div className="text-xs text-slate-500">Your catalog, creator conditions and licensing decisions</div></div><div className="flex min-w-0 max-w-full flex-wrap items-center gap-3"><select aria-label="Active organization" value={active.id} onChange={(event) => { setActiveOrgId(event.target.value); safeStorageSet("session", ORG_KEY, event.target.value); }} className="min-w-0 max-w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">{context.organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name} · {organization.role}</option>)}</select>{tourAvailable && <button onClick={() => setShowConsole(false)} className="rounded-lg border border-blue-300 px-3 py-2 text-sm text-blue-700">Return to walkthrough</button>}<span className="hidden text-sm text-slate-600 sm:inline">{context.user.email}</span><button onClick={signOut} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">Sign out</button></div></div></header><main key={organizationConsoleScopeKey(active.id)} className="mx-auto max-w-7xl px-6 py-8"><div className="mb-6 flex flex-wrap gap-2">{tabs.map((item) => <button key={item.id} onClick={() => setTab(item.id)} className={`rounded-xl px-4 py-2 text-sm font-medium ${visibleTab === item.id ? "bg-slate-950 text-white" : "bg-white text-slate-700 shadow-sm"}`}>{item.label}</button>)}</div>{error && <div className="mb-4 rounded-xl bg-red-50 p-3 text-sm text-red-800">{error}</div>}{visibleTab === "connected" && nodeInfo?.federationEnabled && <ConnectedCatalogs key={`${credential.id}:${active.id}`} apiBase={API_BASE} sessionId={credential.id} organizationId={active.id} canPublish={canAdministerPrivacy && canManageRights} synthetic={isPublicSandbox(nodeInfo)} />}{visibleTab === "catalog" && <Catalog session={credential} organization={active} />}{visibleTab === "policies" && <Policies key={policyEditorScopeKey(active.id)} session={credential} organization={active} />}{visibleTab === "authority" && <Authority session={credential} organization={active} />}{visibleTab === "request" && <RequestPermission session={credential} organization={active} />}{visibleTab === "permissions" && <Permissions session={credential} organization={active} />}{visibleTab === "team" && <Team session={credential} organization={active} />}{visibleTab === "operations" && <div className="space-y-6">{canAdministerSetup && <OnboardingChecklist key={active.id} apiBase={API_BASE} sessionId={credential.id} organizationId={active.id} onNavigate={(action) => setTab(action as typeof tab)} />}{canAdministerPrivacy && <PrivacyPanel key={privacyScopeKey(active.id)} apiBase={API_BASE} sessionId={credential.id} organizationId={active.id} />}<Operations session={credential} organization={active} /></div>}{visibleTab === "operator" && <div className="space-y-6"><DeploymentReadinessPanel apiBase={API_BASE} sessionId={credential.id} sourceCodeUrl={nodeInfo?.sourceCodeUrl} /><OperatorReview session={credential} /><OperatorAudit session={credential} /></div>}</main><LegalNotice nodeInfo={nodeInfo}>Your organization supplies evidence of the rights it administers. Clef records its policies, reviewers’ decisions and agreed terms in verifiable receipts.</LegalNotice></div>;
 }

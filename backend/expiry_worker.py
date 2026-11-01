@@ -24,6 +24,7 @@ def _stop(*_args) -> None:
 def expire_once(*, as_of: datetime.date | None = None) -> dict[str, object]:
     # Keep imports lazy so heartbeat health checks never initialize the API or database.
     from main import SessionLocal, expire_due_permissions
+    from services.worker_heartbeat import record_service_heartbeat
 
     evaluated_on = as_of or datetime.date.today()
     db = SessionLocal()
@@ -33,11 +34,31 @@ def expire_once(*, as_of: datetime.date | None = None) -> dict[str, object]:
             as_of=evaluated_on,
             actor={"type": "node_scheduler", "asOf": evaluated_on.isoformat()},
         )
-        return {
+        result = {
             "asOf": evaluated_on.isoformat(),
             "expiredCount": len(receipts),
             "receipts": [row.id for row in receipts],
         }
+        record_service_heartbeat(
+            db,
+            service_name="expiry_worker",
+            succeeded=True,
+            details={"asOf": result["asOf"], "expiredCount": result["expiredCount"]},
+        )
+        return result
+    except Exception as error:
+        db.rollback()
+        try:
+            record_service_heartbeat(
+                db,
+                service_name="expiry_worker",
+                succeeded=False,
+                details={"asOf": evaluated_on.isoformat()},
+                error_type=type(error).__name__,
+            )
+        except Exception:
+            logger.exception("Could not persist expiry worker failure heartbeat")
+        raise
     finally:
         db.close()
 

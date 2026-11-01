@@ -11,6 +11,14 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ""),
       },
+      "/auth": {
+        target: process.env.VITE_API_PROXY_TARGET || "http://localhost:9247",
+        changeOrigin: true,
+      },
+      "/v1": {
+        target: process.env.VITE_API_PROXY_TARGET || "http://localhost:9247",
+        changeOrigin: true,
+      },
     },
   },
   build: {

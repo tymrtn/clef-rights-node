@@ -8,6 +8,14 @@ The node does not turn a catalog lookup into ownership, infer missing rights, or
 
 Clef Rights Node is licensed under `AGPL-3.0-only`. Every staging or production deployment must declare `SOURCE_CODE_URL` for the corresponding source of its exact `SOURCE_CODE_REVISION`; the public node-information endpoint and every console surface disclose both. The operator remains responsible for making that URL complete and accurate, and the launch checklist requires an independent match against the deployed build.
 
+**Future-release licensing:** the [proposed Clef Own-Node License and partner plan](docs/licensing/README.md) permit commercial administration of an organization's own and represented catalogs, with self-installation, Clef-assisted setup, or client-owned installation and support from a separately licensed partner. Hosted/OEM rights require a distinct agreement. The drafts await legal licensor identification, licensing authority review, and designation of covered releases; the current checkout and released alpha retain their AGPL terms. The first release's partner outreach is interest-only, with no paid enrollment or partner entitlement issued.
+
+## Try the prepared demonstrations
+
+With `.venv` and the frontend dependencies installed, run `.venv/bin/python scripts/run_local_preview.py` for a prepared request-to-receipt walkthrough on port `16482`. Run `.venv/bin/python scripts/run_federation_preview.py` for a label and publisher on separate local nodes, with connected catalog search on port `16484`.
+
+Both launchers retain private local state and exercise the real API with fictional catalogs. The [quickstart](docs/QUICKSTART.md) covers the walkthroughs; the [connected-catalog protocol](docs/foundation/CATALOG_FEDERATION.md) covers publication consent, peer configuration and current operating limits.
+
 ## Run a local label node
 
 You need Docker with Compose. The local stack includes PostgreSQL, the API, migrations, the web console, and supervised webhook and permission-expiry workers.
@@ -51,14 +59,24 @@ Start with one client and one composition or recording whose identifiers and aut
 
 - separate email addresses for the label administrator, a rights manager, the independent node operator, and a requester;
 - the client's stable reference from the label's contract or royalty system;
-- an ISWC or MLC song code for a composition, or an ISRC for a recording;
+- an ISWC or a song code from The MLC for a composition, or an ISRC for a recording;
 - the contract or registry reference, controlled share, territory, and SHA-256 fingerprint of any private evidence;
 - the intended-use policy, including AI source material, model environment, duration, retention, attribution, watermark, and review limits;
 - proposed license dates and, if settlement will be tested, exact currency, minimum, royalty basis, and beneficiary splits.
 
-MLC credentials are optional for a local pilot. DDEX credentials and schema files are needed only when testing MWL exchange. Clef never needs the private contract file itself; keep that file in the label's document system and record its location and fingerprint in the authority claim.
+The MLC credentials are optional for a local pilot. DDEX credentials and schema files are needed only when testing MWL exchange. Clef never needs the private contract file itself; keep that file in the label's document system and record its location and fingerprint in the authority claim.
+
+For catalog cleanup, Clef also includes an optional workflow for matching a label's ISRCs against the public Spotify metadata release while keeping every result unverified. The source has no ISWCs and establishes no rights; see [Spotify reference metadata](docs/SPOTIFY_REFERENCE_DATA.md) for the private-storage, matching, and The MLC reconciliation path.
 
 ## Walk through the label workflow
+
+### Permission safety and receipt access
+
+Requesters select all applicable content categories and confirm their declaration. Published content restrictions apply alongside the intended use and AI scope. The requested territory must fit the verified authority; the node rechecks the current policy and authority before signing a grant.
+
+Receipt downloads require requester or authority organization access. The console handles authenticated JSON downloads, while independent verification of a supplied receipt and the public hash chain remain available. See the [receipt protocol](docs/foundation/RECEIPT_PROTOCOL.md#access-and-public-transparency) for API scopes, public-log fields and upgrade notes.
+
+An organization owner or administrator sets publication and retention, exports the organization's records, and runs scoped erasure in **Operations → Data privacy**. See [Data privacy](docs/DATA_PRIVACY.md) for the published field set, the approval path, and the operator procedure covering copies this node keeps elsewhere.
 
 ### 1. Create the label
 
@@ -90,17 +108,19 @@ Download the CSV template. It accepts these columns:
 item_type,title,artist,iswc,isrc,mlc_song_code,territory,client_reference,source_reference
 ```
 
-A work requires an ISWC or MLC song code. A recording requires an ISRC. Titles are never promoted to identifiers. `client_reference` must match a managed client created in the node. Files are limited to 10 MB and 10,000 rows.
+A work requires an ISWC or a song code from The MLC. A recording requires an ISRC. Titles are never promoted to identifiers. `client_reference` must match a managed client created in the node. Files are limited to 10 MB and 10,000 rows.
+
+When an imported record already exists, a changed `client_reference` requires explicit conflict resolution, even if its music metadata is identical. A blank cell in that column requests unassignment; omitting the column preserves the current client. Resolving the row creates a new catalog version and retains the earlier assignment history. Use **Append a client assignment** for a direct administration change to an existing version.
 
 Uploading creates a preview, not catalog records. The preview classifies each row as ready, invalid, duplicated within the file, duplicated against the current catalog, or conflicting with the current catalog. Correct invalid source rows and upload again. For a catalog conflict, record why the row should be skipped or preserved as the next immutable version. Exact-file replays return the existing batch.
 
 Commit requires a separate confirmation. Imported assets and client-assignment events are append-only. A later correction creates version 2 while version 1 remains inspectable. Reassigning a work to another client requires a reason and appends assignment history.
 
-Every imported asset is labeled `catalog_metadata` with `authorityStatus: unverified`. Importing a label schedule, MLC result, or distributor export does not publish a policy, create an authority claim, or authorize a license. CSV intake is working; CWR intake is not part of the production `/v1` workflow yet.
+Every imported asset is labeled `catalog_metadata` with `authorityStatus: unverified`. Importing a label schedule, a result from The MLC, or a distributor export does not publish a policy, create an authority claim, or authorize a license. CSV intake is working; CWR intake is not part of the production `/v1` workflow yet.
 
 ### 4. Publish one work policy
 
-Open **Policies** and select an imported catalog asset; Clef fills its title, artist, and durable work key. You may instead use configured MLC lookup or enter a registry-backed namespace such as `mlc:123456789`, `iswc:T1234567890`, or `isrc:USABC2600001`. Manual `internal:` keys remain possible through the policy API, but they should be treated as provisional identifiers and replaced before external exchange.
+Open **Policies** and select an imported catalog asset; Clef fills its title, artist, and durable work key. You may instead use the configured lookup from The MLC or enter a registry-backed namespace such as `mlc:123456789`, `iswc:T1234567890`, or `isrc:USABC2600001`. Manual `internal:` keys remain possible through the policy API, but they should be treated as provisional identifiers and replaced before external exchange.
 
 For each use, choose `blocked`, `requires_approval`, or `allowed`. AI policy v2 separately records:
 
@@ -122,7 +142,7 @@ The node operator is deliberately separate from the label. Sign in with an addre
 
 When verification collides with an already verified claim for the same work, right, and overlapping territory, Clef compares the declared controlled shares. Compatible splits totaling 100% or less may coexist. Exclusive claims, missing or invalid shares, and totals above 100% move both claims to `disputed` and open an operator conflict. The operator must record evidence before retaining either claim, accepting a compatible split, or rejecting both. Disputed claims disappear from requester discovery until resolved.
 
-For MLC-backed composition evidence, keep the MLC song code, controlled share, and relevant territory available. An MLC lookup is an observed registry result until the operator ties it to a claim.
+For composition evidence from The MLC, retain its song code and reported U.S. publishing information. The operator supplies supporting evidence of controlled shares and territorial authority when making a claim.
 
 ### 6. Register the requester
 
@@ -207,7 +227,7 @@ Open **Operations** as an organization owner or administrator. Issue a separate 
 Available scopes are:
 
 - `directory:read` for the sanitized verified-authority directory;
-- `registry:read` for organization-attributed MLC catalog searches;
+- `registry:read` for organization-attributed catalog searches through The MLC;
 - `rights:read` for this organization's policies;
 - `permissions:read` for permission records involving this organization;
 - `permissions:request` for creating requests as this organization;
@@ -248,11 +268,11 @@ Transient network errors, HTTP 408, 425, 429, and 5xx responses retry with bound
 
 Redirects are not followed. Hostnames are resolved at delivery time, and private, local, reserved, or otherwise non-public addresses fail closed. Production requires HTTPS and a separate `WEBHOOK_ENCRYPTION_KEY_B64`. Secret rotation affects the next attempt, so update the receiver before rotating.
 
-## MLC and DDEX connectors
+## The MLC and DDEX connectors
 
 Operators supply their own credentials and partner configuration through a deployment secret manager. Clef does not bundle keys or infer authorization from a populated environment variable.
 
-### MLC
+### The MLC
 
 Set:
 
@@ -263,7 +283,7 @@ MLC_PASSWORD=...
 MLC_AUTHORIZED_CAPABILITIES=catalog_lookup,ownership_evidence_read
 ```
 
-The adapter returns MLC data as `observed` and permission status as `unknown`. MLC access can support identity and evidence workflows; it does not grant master, adaptation, sync, lyric, voice, or likeness rights.
+The adapter returns results as `observed`, permission status as `unknown`, and a `sourceScope` describing The MLC’s U.S. publishing context and DSP-supplied recording metadata. Master ownership, master shares and authority for each right and territory come from separately reviewed rightsholder evidence. The MLC API connection supports catalog identification and publishing review.
 
 The console uses the organization-scoped lookup route. A machine credential needs `registry:read` and can query only on behalf of its own organization. Each successful lookup appends an audit record containing the query fields, query digest, result count, and machine or human actor; raw search values are not copied into the audit trail. The client reuses short-lived tokens, refreshes once after a 401, applies bounded retries to transient failures, and rejects oversized or malformed responses.
 
@@ -324,19 +344,26 @@ RIGHTS_MAGIC_LINK_SECRET=...
 NODE_ID=urn:your-company:rights-node:production
 NODE_DEPLOYMENT_MODE=adopter_production
 NODE_SIGNING_PRIVATE_KEY_B64=...
-SOURCE_CODE_URL=https://github.com/your-organization/clef-rights-node/tree/your-release
-SOURCE_CODE_REVISION=your-release-or-commit
+SOURCE_CODE_URL=https://github.com/your-organization/clef-rights-node/tree/<full-git-commit-hash>
+SOURCE_CODE_REVISION=<same-full-git-commit-hash>
 WEBHOOK_ENCRYPTION_KEY_B64=...
 NODE_OPERATOR_EMAILS=rights-ops@example.com
-MAILGUN_API_KEY=...
-MAILGUN_DOMAIN=...
+NOTIFICATION_PROVIDER=smtp
+NOTIFICATION_FROM_EMAIL=Rights Desk <rights@example.com>
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=...
+SMTP_PASSWORD=...
+SMTP_SECURITY=starttls
 CONSOLE_BASE_URL=https://rights.example.com
 CORS_ALLOW_ORIGINS=https://rights.example.com
 ```
 
-Generate `RIGHTS_MAGIC_LINK_SECRET` with a cryptographically secure secret generator. Generate the Ed25519 key in the destination secret manager or an offline environment; the value is a URL-safe base64 encoding of the raw 32-byte private key. Keep the same key across restarts. A missing key creates an ephemeral development identity, and production refuses it. Set `SOURCE_CODE_REVISION` from the immutable release tag or commit deployed, and make `SOURCE_CODE_URL` resolve to downloadable corresponding source for that same revision rather than a moving default branch.
+SMTP is the portable default, but Mailgun remains supported with `NOTIFICATION_PROVIDER=mailgun`, `MAILGUN_API_KEY`, and `MAILGUN_DOMAIN`. The adopter supplies and controls every email credential; Clef ships none.
 
-Set `NODE_DEPLOYMENT_MODE` to `local_evaluation`, `public_sandbox`, `adopter_staging`, or `adopter_production`. Public-sandbox mode is fail-closed: startup rejects live MLC, DDEX, MusicBrainz, OpenRouter, and Slack integrations, while the console identifies the deployment as synthetic on every durable screen. `SANDBOX_GUEST_ACCESS=true` adds rate-limited, anonymous, short-lived sessions only in that mode; it never accepts an email address or creates an identity usable by another deployment.
+Generate `RIGHTS_MAGIC_LINK_SECRET` with a cryptographically secure secret generator. Generate the Ed25519 key in the destination secret manager or an offline environment; the value is a URL-safe base64 encoding of the raw 32-byte private key. Keep the same key across restarts. A missing key creates an ephemeral development identity, and production refuses it. Set `SOURCE_CODE_REVISION` from the full Git commit hash deployed, and make `SOURCE_CODE_URL` resolve to downloadable corresponding source for that same revision rather than a moving default branch.
+
+Set `NODE_DEPLOYMENT_MODE` to `local_evaluation`, `public_sandbox`, `adopter_staging`, or `adopter_production`. Public-sandbox mode is fail-closed: startup rejects live integrations with The MLC, DDEX, MusicBrainz, OpenRouter, and Slack, while the console identifies the deployment as synthetic on every durable screen. `SANDBOX_GUEST_ACCESS=true` adds rate-limited, anonymous, short-lived sessions only in that mode; it never accepts an email address or creates an identity usable by another deployment.
 
 Terminate HTTPS before the web service, encrypt PostgreSQL storage and backups, restrict database access, configure log retention, and test email delivery before inviting users. The application rejects production startup when the required security settings are absent.
 
@@ -358,16 +385,31 @@ make verify-real-pilot
 
 The verifier never creates or changes a node record. It checks 12 independent chains: stable node identity, corresponding source, required adapter capabilities, managed catalog assignment, versioned policy, assigned human decision, exact obligations, signed authority receipt, requester/authority separation, publication and compliance evidence, balanced external payment, and signed reconciliation. It exits nonzero on any mismatch or unknown manifest field; `--synthetic-run` can test the machinery but can never produce `qualified: true`.
 
+## Dependency updates
+
+The container and CI install the complete Python dependency set from `backend/requirements.lock` with hashes enforced. Local development uses `.venv/bin/python -m pip install --require-hashes -r backend/requirements.lock`. Keep `backend/requirements.txt` as the direct dependency input.
+
+For an update, change the intended direct pins, then run `uv pip compile backend/requirements.txt --universal --python-version 3.11 --generate-hashes --output-file backend/requirements.lock`. Inspect the resolved changes and run `uvx --from pip-audit==2.10.1 pip-audit --require-hashes --disable-pip -r backend/requirements.lock`. Complete the application, PostgreSQL migration, receipt and container checks before adopting the new lock. CI reports newly published advisories so operators can schedule a reviewed update.
+
 ## Repeatable acceptance checks
+
+Install `scripts/requirements-test-reference.txt` into the test environment to exercise the synthetic Spotify–The MLC reconciliation fixtures. CI installs this dependency explicitly; it requires no catalog download or partner credentials.
+
+The same rightsholder verifier can exercise PostgreSQL. Provision a dedicated empty test database, place its `postgresql+psycopg2` URL in `CLEF_WORKFLOW_POSTGRES_URL`, then run:
+
+```bash
+.venv/bin/python scripts/verify_rightsholder_workflow.py --postgres-test-url-env CLEF_WORKFLOW_POSTGRES_URL
+```
+
+This command migrates the test database and leaves synthetic workflow records for inspection. It refuses databases containing user objects before running migrations. Use a fresh database for each run; the verifier does not delete existing data. The report identifies `databaseDialect`, and CI runs PostgreSQL workflow acceptance separately from fresh migration upgrade/downgrade checks. The default command continues to use a temporary SQLite database.
 
 Run these after a code change or deployment configuration change:
 
 ```bash
-make test-local
-cd frontend && npm run build && cd ..
-make verify-workflow
-make verify-ddex
+make verify-alpha
 ```
+
+That single command runs the backend suite, production frontend build, 30-gate synthetic rights-holder workflow, pinned DDEX fixtures, deployment-configuration checks, public-history privacy and credential scan, and patch-whitespace validation. `make verify-public` can run the repository scan independently; it examines every public Git blob plus the current non-ignored working tree and never prints matched secret values.
 
 `make verify-workflow` creates and migrates a fresh temporary database, then tests four independent identities: label owner, client rights manager, node operator, and requester. Its 30 gates cover migration state, one-time authentication, organization-role separation, scoped and revocable machine credentials, cross-tenant rejection, previewed catalog import, client assignment, immutable catalog correction, policy publication, encrypted durable webhooks, evidence review, sanitized discovery, derivative and AI permission requests, named-reviewer routing, signed exact credit obligations, publication reporting, authority compliance review, database-trigger immutability, signed machine and human actions, reserve and royalty calculations, external payment and beneficiary payouts, paid reconciliation, audit records, tamper rejection, transparency linkage, and session revocation. It prints a small JSON evidence record and supports `--output PATH` when a CI job needs to retain it.
 
@@ -386,14 +428,14 @@ Working now:
 - append-only organization and node-operator audit views covering the production v1 rights workflow;
 - AES-GCM-encrypted webhook endpoints, atomic delivery outbox, restart-safe worker, bounded retries, dead letters, append-only attempts, and browser administration;
 - immutable settlement terms, reserves, royalty calculations, evidence-backed payments and beneficiary payouts, reversals, deterministic split allocation, and current-ledger reconciliation;
-- hardened, organization-attributed MLC lookup with observed-only results and schema-validated DDEX MWL browser/machine export with append-only acknowledgement evidence.
+- hardened, organization-attributed lookup through The MLC with observed-only results and schema-validated DDEX MWL browser/machine export with append-only acknowledgement evidence.
 
 Still required before a public production launch:
 
 - bilateral DDEX partner conformance, production transport automation, and a production operating agreement;
 - legal review of terms, privacy, evidence policy, retention, and the meaning of each offered permission.
 
-Do not describe the node as an automated MLC, PRO, DDEX, payment processor, or royalty filing service. Clef currently records external settlement evidence; partner delivery and money movement are not implemented.
+Do not describe the node as an automated substitute for The MLC, a PRO, DDEX exchange, payment processing, or royalty filing. Clef currently records external settlement evidence; partner delivery and money movement are not implemented.
 
 ## Protocol documentation
 
@@ -406,6 +448,7 @@ Do not describe the node as an automated MLC, PRO, DDEX, payment processor, or r
 - [Foundation spec](docs/foundation/FOUNDATION_SPEC.md)
 - [Trust model](docs/foundation/TRUST_MODEL.md)
 - [Receipt protocol](docs/foundation/RECEIPT_PROTOCOL.md)
+- [Data privacy](docs/DATA_PRIVACY.md)
 - [AI policy schema](docs/foundation/AI_POLICY_SCHEMA.md)
 - [Adapter contract](docs/foundation/ADAPTER_CONTRACT.md)
 - [Self-hosting](docs/SELF_HOSTING.md)
@@ -420,4 +463,4 @@ The inherited demo can still be evaluated with `env.demo.sample` and `VITE_DEMO_
 - Protocol and security reviewers: use the review packet and report security defects privately.
 - Implementers: propose compatibility changes through an RFC; report standards gaps without implying endorsement by a standards body.
 
-The roadmap tracks product intent, not commitments. No MLC, DDEX, PRO, CMO, label, publisher, platform, or coalition has approved or endorsed Clef unless a dated public statement says so.
+The roadmap tracks product intent, not commitments. Any claim of approval or endorsement by The MLC, DDEX, a PRO, CMO, label, publisher, platform, or coalition requires a dated public statement.

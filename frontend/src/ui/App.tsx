@@ -10,11 +10,12 @@ import { IntegrationStatus } from "./IntegrationStatus";
 import { checkedJson } from "../utils/http";
 import { safeStorageGet, safeStorageRemove } from "../utils/storage";
 
-function normaliseKey(row: any) {
+export function normaliseKey(row: any, entityType?: CatalogRow["type"]) {
+  const type = entityType || row.type || (row.isrc ? "recording" : "work");
   const mlcSongCode = row.mlcSongCode || row.mlcsongCode;
-  if (mlcSongCode) return `mlc:${mlcSongCode}`;
-  if (row.isrc) return `isrc:${row.isrc}`;
-  if (row.mbid || row.id) return `source:${row.mbid || row.id}`;
+  if (type === "recording" && row.isrc) return `isrc:${row.isrc}`;
+  if (type === "work" && mlcSongCode) return `mlc:${mlcSongCode}`;
+  if (row.mbid || row.id) return `source:${type}:${row.mbid || row.id}`;
   const title = row.title || row.workTitle;
   const artist = row.artist || row.performer;
   const release = row.release || row.releaseTitle || row.releaseDate;
@@ -22,7 +23,7 @@ function normaliseKey(row: any) {
   const publishers = JSON.stringify(row.publishers || row.publisher || []);
   if (title && (artist || release || writers !== "[]" || publishers !== "[]")) {
     const composite = [
-      row.type || (row.isrc ? "recording" : "work"),
+      type,
       title,
       artist || "",
       release || "",
@@ -38,6 +39,21 @@ function normaliseKey(row: any) {
 
 function isProvisionalCatalogKey(key: string) {
   return key.startsWith("candidate:") || key.startsWith("unresolved:");
+}
+
+export function shouldSearchSongCode(filters: {
+  title?: string;
+  publisher?: string;
+  writer?: string;
+}): boolean {
+  return Boolean(filters.title || filters.publisher || filters.writer);
+}
+
+export function deepLinkOwnerMatchesSession(
+  referencedOwner: string | undefined,
+  activeOwner: string | null
+): boolean {
+  return !referencedOwner || referencedOwner === activeOwner;
 }
 
 export function readStoredEmail(key: string): string | null {
@@ -68,7 +84,7 @@ async function hydrateRowFromMlc(
     if (songcodeData.results && songcodeData.results.length > 0) {
       const item = songcodeData.results[0];
       return {
-        key: normaliseKey(item),
+        key: normaliseKey(item, "work"),
         title: item.workTitle || item.title || row.title || row.key,
         type: "work",
         artist: item.artist || artistFallback,
@@ -91,7 +107,7 @@ async function hydrateRowFromMlc(
     if (recordingsData.results && recordingsData.results.length > 0) {
       const item = recordingsData.results[0];
       return {
-        key: normaliseKey(item),
+        key: normaliseKey(item, "recording"),
         title: item.title || row.title || row.key,
         type: "recording",
         artist: item.artist || artistFallback,
@@ -108,6 +124,11 @@ async function hydrateRowFromMlc(
 }
 
 export function App() {
+  const [identityGeneration, setIdentityGeneration] = React.useState(0);
+  return <SessionConsole key={identityGeneration} onIdentityReset={() => setIdentityGeneration(value => value + 1)} />;
+}
+
+function SessionConsole({ onIdentityReset }: { onIdentityReset: () => void }) {
   const [view, setView] = React.useState<"catalog" | "detail" | "dashboard">(
     "catalog"
   );
@@ -140,6 +161,10 @@ export function App() {
   const [drawerLoading, setDrawerLoading] = React.useState(false);
   const drawerRequestIdRef = React.useRef(0);
   const searchRequestIdRef = React.useRef(0);
+  React.useEffect(() => () => {
+    drawerRequestIdRef.current += 1;
+    searchRequestIdRef.current += 1;
+  }, []);
   const [bulkOpen, setBulkOpen] = React.useState(false);
   const [toast, setToast] = React.useState<string | null>(null);
   const [catalogMode, setCatalogMode] = React.useState<"external" | "managed">(
@@ -222,29 +247,35 @@ export function App() {
         writer_lastname: payloadWriter,
         publisher: payloadPublisher,
       };
-      const scResp = await fetch("/api/mlc/search/songcode", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...apiHeaders(),
-        },
-        body: JSON.stringify(payload),
-      });
-      const scData = await checkedJson(scResp, "Song-code search");
-      const songcodeRows = (scData.results || []).map((item: any) => ({
-        key: normaliseKey(item),
-        title: item.workTitle || item.title || "Untitled",
-        type: "work" as const,
-        artist: item.artist || item.performer || undefined,
-        mlcSongCode: item.mlcSongCode,
-        isrc: item.isrc,
-        raw: item,
-      }));
-      rows.push(...songcodeRows);
+      if (shouldSearchSongCode({
+        title: payloadTitle,
+        publisher: payloadPublisher,
+        writer: payloadWriter,
+      })) {
+        const scResp = await fetch("/api/mlc/search/songcode", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...apiHeaders(),
+          },
+          body: JSON.stringify(payload),
+        });
+        const scData = await checkedJson(scResp, "Song-code search");
+        const songcodeRows = (scData.results || []).map((item: any) => ({
+          key: normaliseKey(item, "work"),
+          title: item.workTitle || item.title || "Untitled",
+          type: "work" as const,
+          artist: item.artist || item.performer || undefined,
+          mlcSongCode: item.mlcSongCode,
+          isrc: item.isrc,
+          raw: item,
+        }));
+        rows.push(...songcodeRows);
+      }
 
-      // Artist-only search: Use MusicBrainz to get catalog, then query MLC
+      // Artist-only search: Use MusicBrainz to get catalog, then query The MLC
       if (payloadArtist) {
-        // If we have a title, search MLC directly
+        // If we have a title, search The MLC directly
         if (payloadTitle) {
           const recResp = await fetch("/api/mlc/search/recordings", {
             method: "POST",
@@ -262,7 +293,7 @@ export function App() {
           if (requestId === searchRequestIdRef.current) setToast(recData.note);
           }
           const recRows = (recData.results || []).map((item: any) => ({
-            key: normaliseKey(item),
+            key: normaliseKey(item, "recording"),
             title: item.title || "Untitled",
             type: "recording" as const,
             artist: item.artist || item.performer || undefined,
@@ -272,7 +303,7 @@ export function App() {
           }));
           rows.push(...recRows);
         } else {
-          // Artist-only: Use MusicBrainz to get song titles, then query MLC for each
+          // Artist-only: Use MusicBrainz to get song titles, then query The MLC for each
           try {
             const mbResp = await fetch("/api/musicbrainz/search", {
               method: "POST",
@@ -282,23 +313,23 @@ export function App() {
               },
               body: JSON.stringify({
                 artist: payloadArtist,
-                limit: 50, // Limit to avoid too many MLC queries
+                limit: 50, // Limit to avoid too many The MLC queries
               }),
             });
             const mbData = await checkedJson(mbResp, "MusicBrainz search");
 
             if (mbData.musicbrainz_enabled && mbData.results?.length > 0) {
-              // Use MusicBrainz results directly, then enrich with MLC data
+              // Use MusicBrainz results directly, then enrich with The MLC data
               const mbRows = mbData.results.map((item: any) => ({
                 key: normaliseKey({
                   ...item,
                   artist: item.artist || payloadArtist,
                   type: "recording",
-                }),
+                }, "recording"),
                 title: item.title || "Untitled",
                 type: "recording" as const,
                 artist: item.artist || payloadArtist,
-                mlcSongCode: undefined, // Will be enriched if MLC query succeeds
+                mlcSongCode: undefined, // Will be enriched if The MLC query succeeds
                 isrc: item.isrc,
                 release: item.release,
                 releaseDate: item.releaseDate,
@@ -307,7 +338,7 @@ export function App() {
               }));
               rows.push(...mbRows);
 
-              // Optionally: Query MLC for top results to get MLC song codes
+              // Optionally: Query The MLC for top results to get The MLC song codes
               // Limit to first 10 to avoid rate limits
               const topMbResults = mbData.results.slice(0, 10);
               for (const mbItem of topMbResults) {
@@ -324,9 +355,9 @@ export function App() {
                         title: mbItem.title,
                       }),
                     });
-                    const mlcData = await checkedJson(mlcResp, "MLC enrichment");
+                    const mlcData = await checkedJson(mlcResp, "The MLC enrichment");
                     if (mlcData.results?.length > 0) {
-                      // Update the corresponding row with MLC data
+                      // Update the corresponding row with The MLC data
                       const existingRow = rows.find(
                         (r) =>
                           r.mbid === mbItem.mbid ||
@@ -348,7 +379,7 @@ export function App() {
                     await new Promise((resolve) => setTimeout(resolve, 200));
                   } catch (err) {
                     console.warn(
-                      `MLC enrichment failed for ${mbItem.title}:`,
+                      `The MLC enrichment failed for ${mbItem.title}:`,
                       err
                     );
                   }
@@ -359,7 +390,7 @@ export function App() {
             }
           } catch (err) {
             console.error("MusicBrainz search failed:", err);
-            // Fallback: Try MLC anyway (might work for some artists)
+            // Fallback: Try The MLC anyway (might work for some artists)
             const recResp = await fetch("/api/mlc/search/recordings", {
               method: "POST",
               headers: {
@@ -378,7 +409,7 @@ export function App() {
               );
             }
             const recRows = (recData.results || []).map((item: any) => ({
-              key: normaliseKey(item),
+              key: normaliseKey(item, "recording"),
               title: item.title || "Untitled",
               type: "recording" as const,
               artist: item.artist || item.performer || undefined,
@@ -468,10 +499,11 @@ export function App() {
   );
 
   async function saveContract(contract: any) {
-    if (!ownerEmail || !selectedRow || !drawerRecordKey || drawerLoading) return;
+    if (!ownerEmail || !selectedRow || !drawerRecordKey || drawerLoading) return false;
     if (drawerRecordKey !== selectedRow.key) {
       throw new Error("The displayed policy no longer matches the selected work");
     }
+    const editorGeneration = drawerRequestIdRef.current;
     const res = await fetch("/api/rights/save", {
       method: "POST",
       headers: {
@@ -485,6 +517,7 @@ export function App() {
         expected_version: drawerData?.version ?? 0,
       }),
     });
+    if (editorGeneration !== drawerRequestIdRef.current) return false;
     if (!res.ok) {
       if (res.status === 409) {
         throw new Error("This policy changed in another session. Reload it before saving.");
@@ -492,6 +525,7 @@ export function App() {
       throw new Error(`Save failed (${res.status})`);
     }
     const data = await res.json();
+    if (editorGeneration !== drawerRequestIdRef.current) return false;
     setDrawerData({
       contract: data.contract,
       matrix: data.matrix,
@@ -502,6 +536,7 @@ export function App() {
     setResults((prev) =>
       prev.map((r) => (r.key === drawerRecordKey ? { ...r } : r))
     );
+    return true;
   }
 
   function closeDrawer() {
@@ -511,6 +546,15 @@ export function App() {
     setDrawerRecordKey(null);
     setSelectedRow(null);
     setView("catalog");
+  }
+
+  function switchCatalogMode(mode: "external" | "managed") {
+    searchRequestIdRef.current += 1;
+    closeDrawer();
+    setResults([]);
+    setSelectedKeys([]);
+    setLoadingResults(false);
+    setCatalogMode(mode);
   }
 
   async function applyBulk({ changes, note }: any) {
@@ -556,9 +600,8 @@ export function App() {
     if (!qpKey) return;
 
     const qpOwner = params.get("owner") || undefined;
-    if (qpOwner && qpOwner !== ownerEmail) {
+    if (!deepLinkOwnerMatchesSession(qpOwner, ownerEmail)) {
       setToast("Open this work from an authenticated session for the referenced organization.");
-      deepLinkProcessedRef.current = true;
       return;
     }
 
@@ -589,7 +632,7 @@ export function App() {
     }
 
     deepLinkProcessedRef.current = true;
-  }, []);
+  }, [ownerEmail]);
 
   React.useEffect(() => {
     if (!pendingDeepLink) return;
@@ -701,7 +744,7 @@ export function App() {
                     setOwnerEmail(null);
                     setUserEmail(null);
                     setUserRole("publisher");
-                    setToast("Signed out");
+                    onIdentityReset();
                   }}
                   id="rc-logout"
                   title="Sign out"
@@ -759,10 +802,10 @@ export function App() {
                         <div className="text-xs text-gray-500 mt-0.5">
                           {catalogMode === "external"
                             ? userRole === "cmo"
-                              ? "Search MLC/MusicBrainz to find and verify works"
+                              ? "Search The MLC/MusicBrainz to find and verify works"
                               : userRole === "artist"
                               ? "Search public catalogs to find your works"
-                              : "Search MLC/MusicBrainz to import works"
+                              : "Search The MLC/MusicBrainz to import works"
                             : userRole === "cmo"
                             ? "Browse registered works and verify rights declarations"
                             : userRole === "artist"
@@ -778,13 +821,13 @@ export function App() {
                               ? "bg-blue-600 text-white"
                               : "bg-gray-100 text-gray-700 hover:bg-gray-200"
                           }`}
-                          onClick={() => setCatalogMode("external")}
+                          onClick={() => switchCatalogMode("external")}
                         >
                           {userRole === "cmo"
                             ? "Public Registries"
                             : userRole === "artist"
                             ? "Find My Works"
-                            : "Import from MLC"}
+                            : "Import from The MLC"}
                         </button>
                         <button
                           id="rc-mode-managed"
@@ -793,7 +836,7 @@ export function App() {
                               ? "bg-blue-600 text-white"
                               : "bg-gray-100 text-gray-700 hover:bg-gray-200"
                           }`}
-                          onClick={() => setCatalogMode("managed")}
+                          onClick={() => switchCatalogMode("managed")}
                         >
                           {userRole === "cmo"
                             ? "Under Review"
@@ -851,7 +894,7 @@ export function App() {
                             ? "Search Public Registries"
                             : userRole === "artist"
                             ? "Find Your Works"
-                            : "Search MLC Catalog"}
+                            : "Search The MLC Catalog"}
                         </h3>
                         <span className="text-xs text-gray-500">
                           {userRole === "artist"
@@ -885,7 +928,7 @@ export function App() {
                                       }`
                                 );
                                 // Auto-switch to managed mode to show the seeded items
-                                setCatalogMode("managed");
+                                switchCatalogMode("managed");
                               } catch {
                                 setToast("Unable to seed sample catalog");
                               }
@@ -1024,12 +1067,12 @@ export function App() {
                             ? `Loaded ${data.created} sample items`
                             : `Sample catalog ready (${(data.created || 0) + (data.duplicates || 0)} items)`
                         );
-                        setCatalogMode("managed");
+                        switchCatalogMode("managed");
                       } catch {
                         setToast("Unable to load sample catalog");
                       }
                     }}
-                    onSwitchToExternal={() => setCatalogMode("external")}
+                    onSwitchToExternal={() => switchCatalogMode("external")}
                   />
                 )}
               </>
@@ -1038,8 +1081,9 @@ export function App() {
         )}
       </main>
 
-      {selectedRow && view === "detail" && (
+      {ownerEmail && userEmail && selectedRow && view === "detail" && (
         <RightsDrawer
+          key={selectedRow.key}
           row={selectedRow}
           data={drawerData}
           loading={drawerLoading}
@@ -1049,7 +1093,7 @@ export function App() {
       )}
 
       <BulkEditModal
-        open={bulkOpen}
+        open={Boolean(ownerEmail && userEmail && bulkOpen)}
         onClose={() => setBulkOpen(false)}
         onApply={applyBulk}
         selectedCount={selectedKeys.length}

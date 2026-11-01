@@ -1,0 +1,107 @@
+{
+  "schemaVersion": "clef.railway-template.v1",
+  "ownership": "adopter",
+  "source": {
+    "repository": "https://github.com/tymrtn/clef-rights-node",
+    "pinRequired": true
+  },
+  "services": [
+    {
+      "name": "Postgres",
+      "kind": "railway-postgresql",
+      "public": false
+    },
+    {
+      "name": "api",
+      "root": "/backend",
+      "config": "/backend/railway.json",
+      "public": false,
+      "replicas": 1
+    },
+    {
+      "name": "webhook-worker",
+      "root": "/backend",
+      "config": "/backend/railway.worker.json",
+      "public": false,
+      "replicas": 1
+    },
+    {
+      "name": "expiry-worker",
+      "root": "/backend",
+      "config": "/backend/railway.expiry.json",
+      "public": false,
+      "replicas": 1,
+      "singleton": true
+    },
+    {
+      "name": "web",
+      "root": "/frontend",
+      "config": "/frontend/railway.json",
+      "public": true,
+      "replicas": 1
+    }
+  ],
+  "referenceVariables": {
+    "DATABASE_URL": "${{Postgres.DATABASE_URL}}",
+    "API_UPSTREAM": "http://${{api.RAILWAY_PRIVATE_DOMAIN}}:${{api.PORT}}"
+  },
+  "composerVariables": {
+    "generatedInAdopterProject": {
+      "RIGHTS_MAGIC_LINK_SECRET": "${{secret(64)}}",
+      "NODE_SIGNING_PRIVATE_KEY_B64": "${{secret(43, \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/\")}}=",
+      "WEBHOOK_ENCRYPTION_KEY_B64": "${{secret(43, \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/\")}}="
+    },
+    "requiredAdopterInputs": [
+      "NODE_OPERATOR_EMAILS",
+      "NOTIFICATION_FROM_EMAIL",
+      "SMTP_HOST",
+      "SMTP_PORT",
+      "SMTP_USERNAME",
+      "SMTP_PASSWORD",
+      "SMTP_SECURITY"
+    ],
+    "requiredPublisherBindings": [
+      "SOURCE_CODE_REVISION",
+      "SOURCE_CODE_URL"
+    ],
+    "derivedInProject": {
+      "DATABASE_URL": "${{Postgres.DATABASE_URL}}",
+      "NODE_ID": "urn:clef:rights-node:${{RAILWAY_PROJECT_ID}}",
+      "CONSOLE_BASE_URL": "https://${{web.RAILWAY_PUBLIC_DOMAIN}}",
+      "CORS_ALLOW_ORIGINS": "https://${{web.RAILWAY_PUBLIC_DOMAIN}}",
+      "API_UPSTREAM": "http://${{api.RAILWAY_PRIVATE_DOMAIN}}:${{api.PORT}}"
+    },
+    "fixedSafeDefaults": {
+      "APP_ENV": "staging",
+      "NODE_DEPLOYMENT_MODE": "adopter_staging",
+      "AUTH_SIGNUP_MODE": "operator_only",
+      "NOTIFICATION_PROVIDER": "smtp",
+      "ALLOW_DEV_IDENTITY_HEADERS": "false",
+      "ALLOW_DEV_MAGIC_LINKS": "false",
+      "MLC_ENABLED": "false",
+      "DDEX_ENABLED": "false",
+      "DDEX_LIVE_MESSAGES": "false",
+      "MUSICBRAINZ_ENABLED": "false",
+      "WEBHOOK_ALLOW_PRIVATE_TARGETS": "false"
+    }
+  },
+  "adopterHeldSecrets": [
+    "RIGHTS_MAGIC_LINK_SECRET (generated in adopter project)",
+    "NODE_SIGNING_PRIVATE_KEY_B64 (generated in adopter project)",
+    "WEBHOOK_ENCRYPTION_KEY_B64 (generated in adopter project)",
+    "SMTP_USERNAME and SMTP_PASSWORD (entered and sealed by adopter)"
+  ],
+  "defaultDisabledIntegrations": [
+    "MLC",
+    "DDEX",
+    "MusicBrainz",
+    "OpenRouter",
+    "Slack"
+  ],
+  "publicationGates": [
+    "fresh adopter-owned project deployed",
+    "operator readiness reports ready",
+    "backup and restore exercised",
+    "second operator records elapsed time and failures"
+  ]
+}

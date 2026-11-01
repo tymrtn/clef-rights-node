@@ -1,5 +1,6 @@
 import os
 from urllib.parse import urlparse
+from services.source_reference import source_url_names_revision
 
 
 class Settings:
@@ -31,6 +32,19 @@ class Settings:
             raise RuntimeError("AUTH_SIGNUP_MODE must be open or operator_only")
         self.MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY")
         self.MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "mg.clef.pro")
+        default_notification_provider = "mailgun" if self.MAILGUN_API_KEY else ("smtp" if os.getenv("SMTP_HOST") else "disabled")
+        self.NOTIFICATION_PROVIDER = os.getenv("NOTIFICATION_PROVIDER", default_notification_provider).strip().lower()
+        self.NOTIFICATION_FROM_EMAIL = os.getenv(
+            "NOTIFICATION_FROM_EMAIL", f"Clef Rights <console@{self.MAILGUN_DOMAIN}>"
+        ).strip()
+        self.NOTIFICATION_CONNECT_TIMEOUT_SECONDS = int(os.getenv("NOTIFICATION_CONNECT_TIMEOUT_SECONDS", "5"))
+        self.NOTIFICATION_READ_TIMEOUT_SECONDS = int(os.getenv("NOTIFICATION_READ_TIMEOUT_SECONDS", "15"))
+        self.SMTP_HOST = (os.getenv("SMTP_HOST") or "").strip()
+        self.SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+        self.SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+        self.SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+        self.SMTP_SECURITY = os.getenv("SMTP_SECURITY", "starttls").strip().lower()
+        self.EMAIL_DELIVERY_CONFIGURED = self.NOTIFICATION_PROVIDER in {"mailgun", "smtp"}
         self.CONSOLE_BASE_URL = os.getenv("CONSOLE_BASE_URL", "http://localhost:5174")
         self.SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
@@ -48,6 +62,10 @@ class Settings:
             "SANDBOX_GUEST_ACCESS", "false"
         ).lower() in ("1", "true", "yes", "on")
         self.NODE_SIGNING_PRIVATE_KEY_B64 = os.getenv("NODE_SIGNING_PRIVATE_KEY_B64")
+        self.FEDERATION_ENABLED = os.getenv("FEDERATION_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+        self.FEDERATION_PUBLIC_ORIGIN = os.getenv("FEDERATION_PUBLIC_ORIGIN", "")
+        self.FEDERATION_PEERS_JSON = os.getenv("FEDERATION_PEERS_JSON", "[]")
+        self.FEDERATION_ALLOW_LOOPBACK = os.getenv("FEDERATION_ALLOW_LOOPBACK", "false").lower() in ("1", "true", "yes", "on")
         self.SOURCE_CODE_URL = (os.getenv("SOURCE_CODE_URL") or "").strip()
         self.SOURCE_CODE_REVISION = (os.getenv("SOURCE_CODE_REVISION") or "development").strip()
 
@@ -149,6 +167,23 @@ class Settings:
 
     def _validate(self) -> None:
         production_like = self.APP_ENV.lower() in {"staging", "production"}
+        if self.NOTIFICATION_PROVIDER not in {"disabled", "mailgun", "smtp"}:
+            raise RuntimeError("NOTIFICATION_PROVIDER must be disabled, mailgun, or smtp")
+        if not 1 <= self.NOTIFICATION_CONNECT_TIMEOUT_SECONDS <= 30:
+            raise RuntimeError("NOTIFICATION_CONNECT_TIMEOUT_SECONDS must be between 1 and 30")
+        if not 1 <= self.NOTIFICATION_READ_TIMEOUT_SECONDS <= 120:
+            raise RuntimeError("NOTIFICATION_READ_TIMEOUT_SECONDS must be between 1 and 120")
+        if not self.NOTIFICATION_FROM_EMAIL or "\n" in self.NOTIFICATION_FROM_EMAIL or "\r" in self.NOTIFICATION_FROM_EMAIL:
+            raise RuntimeError("NOTIFICATION_FROM_EMAIL must be a non-empty single-line mailbox")
+        if self.NOTIFICATION_PROVIDER == "mailgun" and (not self.MAILGUN_API_KEY or not self.MAILGUN_DOMAIN):
+            raise RuntimeError("Mailgun email delivery requires MAILGUN_API_KEY and MAILGUN_DOMAIN")
+        if self.NOTIFICATION_PROVIDER == "smtp":
+            if not self.SMTP_HOST or not 1 <= self.SMTP_PORT <= 65535:
+                raise RuntimeError("SMTP email delivery requires SMTP_HOST and a valid SMTP_PORT")
+            if self.SMTP_SECURITY not in {"none", "starttls", "implicit"}:
+                raise RuntimeError("SMTP_SECURITY must be none, starttls, or implicit")
+            if bool(self.SMTP_USERNAME) != bool(self.SMTP_PASSWORD):
+                raise RuntimeError("SMTP_USERNAME and SMTP_PASSWORD must be configured together")
         allowed_deployment_modes = {
             "local_evaluation",
             "public_sandbox",
@@ -188,6 +223,8 @@ class Settings:
             raise RuntimeError(
                 "Public sandbox mode requires WEBHOOK_DELIVERY_ENABLED=false"
             )
+        if self.NODE_DEPLOYMENT_MODE == "public_sandbox" and self.EMAIL_DELIVERY_CONFIGURED:
+            raise RuntimeError("Public sandbox mode requires NOTIFICATION_PROVIDER=disabled")
         if self.SOURCE_CODE_URL:
             parsed_source_url = urlparse(self.SOURCE_CODE_URL)
             allowed_source_schemes = {"https"} if production_like else {"http", "https"}
@@ -213,8 +250,12 @@ class Settings:
             raise RuntimeError("A durable shared database is required in staging/production")
         if not self.NODE_OPERATOR_EMAILS and not sandbox_guest_only:
             raise RuntimeError("NODE_OPERATOR_EMAILS is required in staging/production")
-        if (not self.MAILGUN_API_KEY or not self.MAILGUN_DOMAIN) and not sandbox_guest_only:
+        if not self.EMAIL_DELIVERY_CONFIGURED and not sandbox_guest_only:
             raise RuntimeError("Configured email delivery is required in staging/production")
+        if self.NOTIFICATION_PROVIDER == "smtp" and (
+            not self.SMTP_USERNAME or not self.SMTP_PASSWORD or self.SMTP_SECURITY == "none"
+        ):
+            raise RuntimeError("Production SMTP requires authentication and encrypted transport")
         if "*" in self.CORS_ALLOW_ORIGINS:
             raise RuntimeError("Wildcard CORS origins are forbidden in staging/production")
         if self.DDEX_LIVE_MESSAGES and self.APP_ENV.lower() != "production":
@@ -227,6 +268,8 @@ class Settings:
             raise RuntimeError(
                 "SOURCE_CODE_URL and SOURCE_CODE_REVISION are required in staging/production"
             )
+        if not source_url_names_revision(self.SOURCE_CODE_URL, self.SOURCE_CODE_REVISION):
+            raise RuntimeError("SOURCE_CODE_REVISION must be a full Git commit hash named in SOURCE_CODE_URL in staging/production")
         if self.MLC_ENABLED:
             if not self.MLC_USERNAME or not self.MLC_PASSWORD:
                 raise RuntimeError("MLC_ENABLED requires MLC_USERNAME and MLC_PASSWORD")
