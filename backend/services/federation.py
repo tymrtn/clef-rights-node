@@ -1,13 +1,18 @@
-"""Pinned, bounded discovery between explicitly configured rights nodes.
+"""Pinned, bounded exchange between explicitly configured rights nodes.
 
 Discovery statements have their own schema and expiry. They never enter the
 permission ledger. No requester credentials are forwarded to another node.
+Permission requests travel as statements signed by the requesting node; the
+source node answers with signed status statements that carry its receipts.
+Every statement names its schemaVersion, and every verifier accepts exactly
+one schema, so a signature over one statement type never verifies as another.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import http.client
@@ -18,20 +23,35 @@ import socket
 import ssl
 import threading
 import time
+import unicodedata
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from services.receipts import CANONICALIZATION, canonical_json, sha256_hex
+from services.receipts import CANONICALIZATION, ReceiptSigner, canonical_json, sha256_hex
 
 SCHEMA = "clef.catalog-discovery.v1"
+REQUEST_SCHEMA = "clef.permission-request.v1"
+STATUS_QUERY_SCHEMA = "clef.permission-status-query.v1"
+STATUS_SCHEMA = "clef.permission-status.v1"
+TERMS_SCHEMA = "clef.catalog-terms.v1"
+DESCRIPTOR_SCHEMA = "clef.node-descriptor.v1"
 STATEMENT_TTL = 60
+REQUEST_TTL = 300
+REQUEST_TIMEOUT = 10.0
+MAX_REQUEST_BYTES = 65536
 MAX_BYTES = 262144
 PEER_TIMEOUT = 3.0
 MAX_PEERS = 8
-_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="clef-discovery")
-_CAPACITY = threading.BoundedSemaphore(8)
+# A stalled peer can hold at most its own slots; other peers keep their capacity.
+PER_PEER_CAPACITY = 4
+_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="clef-discovery")
+_CAPACITY = threading.BoundedSemaphore(32)
+_PEER_CAPACITY: dict[str, threading.BoundedSemaphore] = {}
+_PEER_CAPACITY_LOCK = threading.Lock()
+# Invisible, bidirectional-override, private-use and unassigned characters can disguise a query.
+_UNPRINTABLE = {"Cc", "Cf", "Cs", "Co", "Cn"}
 
 
 class ClosedModel(BaseModel):
@@ -45,7 +65,7 @@ class SearchInput(ClosedModel):
     @field_validator("query")
     @classmethod
     def clean_query(cls, value):
-        if len(value.strip()) < 2 or any(ord(c) < 32 for c in value):
+        if len(value.strip()) < 2 or any(unicodedata.category(c) in _UNPRINTABLE for c in value):
             raise ValueError("Enter at least two printable characters")
         return value.strip()
 
@@ -106,12 +126,70 @@ def sign_discovery(signer, payload: DiscoveryPayload) -> dict:
         body["truncated"] = True
 
 
+class NodeReference(ClosedModel):
+    nodeId: str = Field(min_length=1, max_length=200)
+    origin: str = Field(min_length=1, max_length=500)
+
+
+class PermissionRequestPayload(ClosedModel):
+    schemaVersion: Literal["clef.permission-request.v1"]
+    requestId: str = Field(pattern=r"^[a-zA-Z0-9_-]{16,100}$")
+    requesterNode: NodeReference
+    sourceNodeId: str = Field(min_length=1, max_length=200)
+    requester: PublicOrganization
+    publicationId: str = Field(min_length=1, max_length=100)
+    intendedUsage: str = Field(min_length=1, max_length=100)
+    territory: str = Field(min_length=1, max_length=500)
+    termStart: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    termEnd: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    context: dict[str, Any]
+    issuedAt: int
+    expiresAt: int
+
+
+class StatusQueryPayload(ClosedModel):
+    schemaVersion: Literal["clef.permission-status-query.v1"]
+    requestId: str = Field(pattern=r"^[a-zA-Z0-9_-]{16,100}$")
+    requesterNode: NodeReference
+    sourceNodeId: str = Field(min_length=1, max_length=200)
+    nonce: str = Field(pattern=r"^[a-zA-Z0-9_-]{32,80}$")
+    issuedAt: int
+    expiresAt: int
+
+
+class PermissionStatusPayload(ClosedModel):
+    schemaVersion: Literal["clef.permission-status.v1"]
+    nodeId: str = Field(min_length=1, max_length=200)
+    origin: str = Field(min_length=1, max_length=500)
+    requestId: str = Field(pattern=r"^[a-zA-Z0-9_-]{16,100}$")
+    requesterNodeId: str = Field(min_length=1, max_length=200)
+    nonce: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_-]{32,80}$")
+    permissionRequestId: str = Field(min_length=1, max_length=100)
+    status: Literal["pending", "approved", "rejected", "revoked", "expired", "disputed", "corrected"]
+    policyState: str | None = Field(default=None, max_length=100)
+    decidedAt: str | None = Field(default=None, max_length=40)
+    decisionNote: str | None = None
+    # Envelopes as GET /v1/receipts/{id} returns them to a requesting party, newest last.
+    receipts: list[dict[str, Any]] = Field(max_length=20)
+    receiptsOmitted: int = Field(default=0, ge=0)
+    issuedAt: int
+    expiresAt: int
+
+
 @dataclass(frozen=True)
 class Peer:
     id: str
     origin: str
     node_id: str
     public_key: str
+    # Pinned in advance so the peer can rotate its signing key without an outage.
+    next_public_key: str | None = None
+    # Keys the peer signed with before a rotation: accepted on carried receipts, never on new statements.
+    retired_keys: tuple[str, ...] = ()
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return (self.public_key,) if not self.next_public_key else (self.public_key, self.next_public_key)
 
 
 def decode_key(value: str) -> bytes:
@@ -124,7 +202,7 @@ def decode_key(value: str) -> bytes:
 
 
 def public_address(ip) -> bool:
-    if not ip.is_global:
+    if not ip.is_global or ip.is_multicast:
         return False
     if isinstance(ip, ipaddress.IPv6Address):
         # Exclude translation/tunnel forms whose eventual IPv4 destination can
@@ -184,18 +262,25 @@ class FederationConfig:
         peers = []
         seen_ids, seen_nodes, seen_origins = {"local"}, {signer.node_id}, {origin}
         for row in raw:
-            if not isinstance(row, dict) or set(row) != {"id", "origin", "nodeId", "publicKey"}:
-                raise ValueError("Each peer requires id, origin, nodeId and publicKey")
+            if not isinstance(row, dict) or not {"id", "origin", "nodeId", "publicKey"} <= set(row) <= {"id", "origin", "nodeId", "publicKey", "nextPublicKey", "retiredPublicKeys"}:
+                raise ValueError("Each peer requires id, origin, nodeId and publicKey; nextPublicKey and retiredPublicKeys are optional")
             if not isinstance(row["id"], str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,60}", row["id"]):
                 raise ValueError("Peer IDs must be short identifiers")
             if not isinstance(row["nodeId"], str) or not 1 <= len(row["nodeId"]) <= 200:
                 raise ValueError("Invalid peer nodeId")
             peer_origin = validate_origin(row["origin"], allow_loopback=local)
             decode_key(row["publicKey"])
+            if "nextPublicKey" in row:
+                decode_key(row["nextPublicKey"])
+            retired = row.get("retiredPublicKeys", [])
+            if not isinstance(retired, list) or len(retired) > 8:
+                raise ValueError("retiredPublicKeys must be a list of at most eight keys")
+            for key in retired:
+                decode_key(key)
             if row["id"] in seen_ids or row["nodeId"] in seen_nodes or peer_origin in seen_origins:
                 raise ValueError("Peer identities and origins must be distinct, including this node")
             seen_ids.add(row["id"]); seen_nodes.add(row["nodeId"]); seen_origins.add(peer_origin)
-            peers.append(Peer(row["id"], peer_origin, row["nodeId"], row["publicKey"]))
+            peers.append(Peer(row["id"], peer_origin, row["nodeId"], row["publicKey"], row.get("nextPublicKey"), tuple(retired)))
         return cls(True, origin, tuple(peers), local)
 
 
@@ -208,7 +293,8 @@ def validate_policy(policy: dict, vocabulary: dict[str, list[str]]) -> dict:
             raise ValueError("Unexpected public policy vocabulary")
         for value in values.values():
             if section == "limits":
-                if value is not None and (type(value) not in {int, float} or not 0 <= value <= 10**12):
+                # Whole numbers serialize identically in every JSON canonicalization peers may implement.
+                if value is not None and (type(value) is not int or not 0 <= value <= 10**12):
                     raise ValueError("Invalid public policy limit")
             elif section == "safeguards":
                 if type(value) is not bool:
@@ -220,25 +306,37 @@ def validate_policy(policy: dict, vocabulary: dict[str, list[str]]) -> dict:
     return policy
 
 
-def verify_statement(statement: dict, peer: Peer, request: PeerSearchInput, vocabulary: dict,
-                     *, now: int | None = None) -> dict:
+def verify_peer_signature(statement: dict, peer: Peer, *, allow_retired: bool = False) -> None:
+    """Check the envelope shape, the pinned signer and the signature; not the payload's meaning."""
     if not isinstance(statement, dict) or set(statement) != {"payload", "proof"}:
-        raise ValueError("Expected a signed discovery statement")
+        raise ValueError("Expected a signed statement")
     proof = statement["proof"]
     if not isinstance(proof, dict) or set(proof) != {"algorithm", "canonicalization", "payloadHash", "keyId", "publicKey", "signature"}:
-        raise ValueError("Invalid discovery proof")
-    public_raw = decode_key(peer.public_key)
+        raise ValueError("Invalid statement proof")
+    if proof["publicKey"] not in (*peer.keys, *(peer.retired_keys if allow_retired else ())):
+        raise ValueError("Statement signer differs from the configured peer")
+    public_raw = decode_key(proof["publicKey"])
     if (proof["algorithm"] != "Ed25519" or proof["canonicalization"] != CANONICALIZATION
-            or proof["publicKey"] != peer.public_key
             or proof["keyId"] != f"ed25519:{hashlib.sha256(public_raw).hexdigest()[:24]}"):
-        raise ValueError("Discovery signer differs from the configured peer")
+        raise ValueError("Statement signer differs from the configured peer")
     raw = canonical_json(statement["payload"])
     if sha256_hex(raw) != proof["payloadHash"]:
-        raise ValueError("Discovery payload changed")
+        raise ValueError("Statement payload changed")
     signature = proof["signature"]
     if not isinstance(signature, str) or not re.fullmatch(r"[A-Za-z0-9_-]{86}", signature):
-        raise ValueError("Invalid discovery signature")
+        raise ValueError("Invalid statement signature")
     Ed25519PublicKey.from_public_bytes(public_raw).verify(base64.b64decode(signature + "==", altchars=b"-_", validate=True), raw)
+
+
+def check_window(issued_at: int, expires_at: int, ttl: int, *, now: int | None = None) -> None:
+    current = int(time.time()) if now is None else now
+    if not (current - ttl <= issued_at <= current + 5 and current < expires_at <= issued_at + ttl and expires_at > issued_at):
+        raise ValueError("Statement is outside its validity window")
+
+
+def verify_statement(statement: dict, peer: Peer, request: PeerSearchInput, vocabulary: dict,
+                     *, now: int | None = None) -> dict:
+    verify_peer_signature(statement, peer)
     payload = DiscoveryPayload.model_validate(statement["payload"]).model_dump()
     current = int(time.time()) if now is None else now
     if (payload["nodeId"] != peer.node_id or payload["origin"] != peer.origin
@@ -266,12 +364,47 @@ def _unique_json(pairs):
     return result
 
 
+def verify_status(statement: dict, peer: Peer, *, request_id: str, requester_node_id: str,
+                  nonce: str | None = None) -> dict:
+    """Verify a source node's answer, including every receipt it carries, against that peer's pins."""
+    verify_peer_signature(statement, peer)
+    payload = PermissionStatusPayload.model_validate(statement["payload"]).model_dump()
+    check_window(payload["issuedAt"], payload["expiresAt"], REQUEST_TTL)
+    if (payload["nodeId"] != peer.node_id or payload["origin"] != peer.origin
+            or payload["requestId"] != request_id or payload["requesterNodeId"] != requester_node_id
+            or payload["nonce"] != nonce):
+        raise ValueError("Status statement belongs to another request or source")
+    for receipt in payload["receipts"]:
+        if not isinstance(receipt, dict) or not isinstance(receipt.get("payload"), dict):
+            raise ValueError("Invalid receipt in status statement")
+        verify_peer_signature({"payload": receipt["payload"], "proof": receipt.get("proof")}, peer, allow_retired=True)
+        if not ReceiptSigner.verify_receipt(receipt).valid or (receipt["payload"].get("node") or {}).get("id") != peer.node_id:
+            raise ValueError("Receipt was not issued by the configured peer")
+    return payload
+
+
+class PeerRejected(ValueError):
+    """The peer answered with a client error; its detail is safe to show the requester."""
+
+    def __init__(self, status: int, detail: str):
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
 def fetch_statement(peer: Peer, request: PeerSearchInput, *, allow_loopback: bool,
                     timeout: float = PEER_TIMEOUT) -> dict:
+    return peer_post(peer, "/v1/federation/catalog/search", canonical_json(request.model_dump()),
+                     allow_loopback=allow_loopback, timeout=timeout)
+
+
+def peer_post(peer: Peer, path: str, body: bytes, *, allow_loopback: bool, timeout: float = PEER_TIMEOUT,
+              reject_detail: bool = False) -> dict:
     """Resolve once, validate every address, then connect to a vetted literal IP.
 
     TLS verifies the configured hostname. Redirects, proxies, cookies, caller
     credentials, compression and arbitrary paths are deliberately absent.
+    With reject_detail, a 4xx JSON answer raises PeerRejected with its detail.
     """
     origin = validate_origin(peer.origin, allow_loopback=allow_loopback)
     parsed = urlsplit(origin)
@@ -291,18 +424,31 @@ def fetch_statement(peer: Peer, request: PeerSearchInput, *, allow_loopback: boo
         raise TimeoutError("Peer lookup timed out")
     sock = socket.socket(family, socktype, proto)
     connection = http.client.HTTPConnection(host, port, timeout=remaining)
+    # Per-read timeouts restart on every byte, so a watchdog enforces the total deadline.
+    live, expired = [sock], threading.Event()
+    def abort():
+        expired.set()
+        try:
+            socket.socket.shutdown(live[0], socket.SHUT_RDWR)
+        except OSError:
+            pass
+    watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), abort)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         sock.settimeout(remaining)
         sock.connect(address)
         if parsed.scheme == "https":
             sock.settimeout(max(0.001, deadline - time.monotonic()))
             sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+            live[0] = sock
         connection.sock = sock
-        connection.request("POST", "/v1/federation/catalog/search", body=canonical_json(request.model_dump()),
+        connection.request("POST", path, body=body,
             headers={"Content-Type": "application/json", "Accept": "application/json", "Accept-Encoding": "identity", "Connection": "close"})
         sock.settimeout(max(0.001, deadline - time.monotonic()))
         response = connection.getresponse()
-        if response.status != 200:
+        rejected = reject_detail and 400 <= response.status < 500
+        if response.status != 200 and not rejected:
             raise ValueError("Peer returned an unsuccessful response")
         if response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
             raise ValueError("Peer did not return JSON")
@@ -324,26 +470,66 @@ def fetch_statement(peer: Peer, request: PeerSearchInput, *, allow_loopback: boo
             if size > MAX_BYTES:
                 raise ValueError("Discovery response exceeds its size limit")
             chunks.append(chunk)
-        return json.loads(b"".join(chunks), object_pairs_hook=_unique_json,
-                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Invalid JSON number")))
+        parsed = json.loads(b"".join(chunks), object_pairs_hook=_unique_json,
+                            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Invalid JSON number")))
+        if rejected:
+            detail = parsed.get("detail") if isinstance(parsed, dict) else None
+            raise PeerRejected(response.status, detail[:300] if isinstance(detail, str) else "The source node declined the request")
+        return parsed
+    except PeerRejected:
+        raise
+    except Exception as error:
+        if expired.is_set():
+            raise TimeoutError("Peer exceeded its total deadline") from error
+        raise
     finally:
+        watchdog.cancel()
         connection.close()
         sock.close()
+
+
+class PeerBusy(RuntimeError):
+    pass
+
+
+@contextmanager
+def reserved(peer: Peer):
+    """Hold one of the peer's slots and one global slot for a synchronous exchange."""
+    with _PEER_CAPACITY_LOCK:
+        own = _PEER_CAPACITY.setdefault(peer.node_id, threading.BoundedSemaphore(PER_PEER_CAPACITY))
+    if not own.acquire(blocking=False):
+        raise PeerBusy(peer.id)
+    if not _CAPACITY.acquire(blocking=False):
+        own.release()
+        raise PeerBusy(peer.id)
+    try:
+        yield
+    finally:
+        _CAPACITY.release()
+        own.release()
 
 
 async def query_peer(peer: Peer, request: PeerSearchInput, vocabulary: dict, *, allow_loopback: bool) -> dict:
     status = {"id": peer.id, "nodeId": peer.node_id, "origin": peer.origin}
     # Capacity remains held until an abandoned DNS/socket worker actually exits.
     # Timeouts therefore cannot create an unbounded queue of background work.
+    with _PEER_CAPACITY_LOCK:
+        own = _PEER_CAPACITY.setdefault(peer.node_id, threading.BoundedSemaphore(PER_PEER_CAPACITY))
     capacity = _CAPACITY
-    if not capacity.acquire(blocking=False):
+    if not own.acquire(blocking=False):
         return {**status, "status": "busy", "entries": []}
+    if not capacity.acquire(blocking=False):
+        own.release()
+        return {**status, "status": "busy", "entries": []}
+    def release(_=None):
+        capacity.release()
+        own.release()
     try:
         future = _EXECUTOR.submit(fetch_statement, peer, request, allow_loopback=allow_loopback)
     except Exception:
-        capacity.release()
+        release()
         raise
-    future.add_done_callback(lambda _: capacity.release())
+    future.add_done_callback(release)
     try:
         wrapped = asyncio.wrap_future(future)
         wrapped.add_done_callback(lambda result: result.exception() if not result.cancelled() else None)

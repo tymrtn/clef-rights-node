@@ -12,9 +12,9 @@ Clef Rights Node is licensed under `AGPL-3.0-only`. Every staging or production 
 
 ## Try the prepared demonstrations
 
-With `.venv` and the frontend dependencies installed, run `.venv/bin/python scripts/run_local_preview.py` for a prepared request-to-receipt walkthrough on port `16482`. Run `.venv/bin/python scripts/run_federation_preview.py` for a label and publisher on separate local nodes, with connected catalog search on port `16484`.
+With `.venv` and the frontend dependencies installed, run `.venv/bin/python scripts/run_local_preview.py` for a prepared request-to-receipt walkthrough on port `16482`. Run `.venv/bin/python scripts/run_federation_preview.py` for a label and publisher on separate local nodes, with connected catalog search and cross-node permission requests on port `16484`.
 
-Both launchers retain private local state and exercise the real API with fictional catalogs. The [quickstart](docs/QUICKSTART.md) covers the walkthroughs; the [connected-catalog protocol](docs/foundation/CATALOG_FEDERATION.md) covers publication consent, peer configuration and current operating limits.
+Both launchers retain private local state and exercise the real API with fictional catalogs. The [quickstart](docs/QUICKSTART.md) covers the walkthroughs; the [connected-catalog protocol](docs/foundation/CATALOG_FEDERATION.md) covers publication consent, cross-node requests, public terms, peer configuration and current operating limits.
 
 ## Run a local label node
 
@@ -428,7 +428,8 @@ Working now:
 - append-only organization and node-operator audit views covering the production v1 rights workflow;
 - AES-GCM-encrypted webhook endpoints, atomic delivery outbox, restart-safe worker, bounded retries, dead letters, append-only attempts, and browser administration;
 - immutable settlement terms, reserves, royalty calculations, evidence-backed payments and beneficiary payouts, reversals, deterministic split allocation, and current-ledger reconciliation;
-- hardened, organization-attributed lookup through The MLC with observed-only results and schema-validated DDEX MWL browser/machine export with append-only acknowledgement evidence.
+- hardened, organization-attributed lookup through The MLC with observed-only results and schema-validated DDEX MWL browser/machine export with append-only acknowledgement evidence;
+- opt-in connected catalogs among configured, key-pinned peers: consented publication, signed search, account-free public terms, and permission requests that the source node decides and receipts (a working candidate with a two-node local proof).
 
 Still required before a public production launch:
 

@@ -644,6 +644,7 @@ def test_verified_authority_permission_receipt_roundtrip():
         "payloadHashValid": True,
         "signatureValid": True,
         "transparencyHashValid": True,
+        "signer": "this_node",
         "error": None,
     }
     receipt["payload"]["permission"]["territory"] = "worldwide"

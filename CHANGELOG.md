@@ -4,6 +4,25 @@ This project follows semantic versioning after its first tagged alpha. Until `1.
 
 ## Unreleased
 
+### Cross-node permission requests and public terms
+
+- Added signed permission requests between configured nodes. The requester's node signs `clef.permission-request.v1`; the source node accepts only pinned peers, rechecks the publication, and decides under its own policy and reviewers. Its `clef.permission-status.v1` answers carry grant and lifecycle receipts, which the requesting node verifies against the source's pinned key. Identical redeliveries return the original record; a reused request ID with different terms is refused.
+- Added **Request terms** and **Sent requests** to Connected catalogs, with the same content-category and AI-use declarations as a local request, and status refresh from the source.
+- Added account-free public terms (`GET /v1/public/catalog/publications/{id}`) and a signed node descriptor (`GET /.well-known/clef-node`). The web image's nginx template now routes these and the peer-facing federation paths at the node origin; `make verify-deployment` checks the route.
+- Added `nextPublicKey` peer pins and `NODE_NEXT_SIGNING_PUBLIC_KEY_B64` for key rotation without an outage, and `scripts/federation_peer.py` to produce a peer entry only after the peer's key ID matches the one verified out of band.
+- **API change:** `POST /v1/receipts/verify` returns `valid: true` only when the signer is this node or a configured peer, and adds `signer`. A self-consistent receipt from an unknown key now returns `signatureValid: true` and `valid: false`.
+- Hardened after an adversarial review: `peer-` organization slugs are reserved and a mismatched represented organization is refused; rate limits, timeouts and source conflicts leave requests retryable; the source rechecks a publication after locking its claim and row, closing a withdrawal race on PostgreSQL; retired keys (`retiredPublicKeys`, `NODE_RETIRED_SIGNING_PUBLIC_KEYS_B64`) keep pre-rotation receipts verifiable; peer enrollment derives the key ID from the key; status statements carry the newest receipts within the size budget and report omissions; refresh releases its database connection during the network call.
+- Migration `0021_federated_requests` adds a peer-node request actor, inbound and outbound federated request records, and member-less requester organizations for peers. Populated federated records prevent destructive downgrade.
+- Extended `scripts/run_federation_preview.py --verify` with a cross-node request, human approval, receipt verification, replay, impostor refusal, public terms and a withdrawn-entry refusal. Added `scripts/verify_hosted_federation.py` for the same proof against two HTTPS deployments.
+
+### Discovery hardening
+
+- Enforced a total peer transport deadline by closing the socket, so a peer that drips bytes cannot hold a worker; added per-peer capacity within a larger shared pool so one slow peer cannot starve searches of others.
+- Moved buyer-search database and signing work off the event loop.
+- Rejected multicast destinations, and invisible, bidirectional-override, private-use and unassigned characters in search queries.
+- Published policy limits are whole numbers so signatures verify across JSON canonicalization implementations.
+- Added tests for the eight-peer limit, query and result bounds, the candidate window, staging loopback refusal, future-dated and over-limit statements, duplicate entries, untrusted TLS certificates and cross-type signature reuse. Federation searches in tests now use a unique organization label, so absence checks cannot pass vacuously.
+
 ### Authority withdrawal and recoverable catalog review
 
 - Added organization-controlled authority withdrawal with a private consequence preview, required reason, current-evidence check and safe retries. Withdrawn claims stop new permissions, pending approval and fresh federated publication; issued grants keep their receipts and separate lifecycle controls.

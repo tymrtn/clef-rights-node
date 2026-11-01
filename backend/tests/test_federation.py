@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 from cryptography.exceptions import InvalidSignature
-from models import AuthorityClaimRecord, CatalogPublicationRecord, OrganizationMembershipRecord, RightsContractRecord
+from models import AuthorityClaimRecord, CatalogPublicationRecord, OrganizationMembershipRecord, OrganizationRecord, RightsContractRecord
 from services import federation
 from services.federation import FederationConfig, Peer, PeerSearchInput, validate_origin, verify_statement
 from services.receipts import ReceiptSigner
@@ -29,6 +29,11 @@ def connected(guest, monkeypatch):
     monkeypatch.setattr(app.state, "federation_config", FederationConfig(True, "https://node.example.test"))
     tour = prepared(guest)
     side = tour["sides"][0]
+    # Every guest's tour uses the same fictional title; a unique label keeps searches hermetic.
+    side["label"] = f"Fictional Label {uuid.uuid4().hex[:12]}"
+    with SessionLocal() as db:
+        db.get(OrganizationRecord, side["orgId"]).name = side["label"]
+        db.commit()
     root = f"/v1/organizations/{side['orgId']}/catalog/publications"
     return guest, tour, side, root
 
@@ -59,7 +64,7 @@ def test_disabled_federation_exposes_no_catalog():
 def test_publication_requires_exact_consent_and_excludes_private_canaries(connected):
     headers, _, side, root = connected
     # Existing internal directory visibility confers no external publication consent.
-    assert all(e["authorityClaimId"] != side["authority"]["id"] for e in public_search()[1]["payload"]["entries"])
+    assert all(e["authorityClaimId"] != side["authority"]["id"] for e in public_search(side["label"])[1]["payload"]["entries"])
     with SessionLocal() as db:
         claim = db.get(AuthorityClaimRecord, side["authority"]["id"])
         claim.evidence = {**claim.evidence, "agreement": "PRIVATE-AGREEMENT-827", "email": "private@example.test", "price": 123456}
@@ -71,7 +76,7 @@ def test_publication_requires_exact_consent_and_excludes_private_canaries(connec
     assert client.post(root, headers=headers, json=request).json()["revision"] == 1  # exact retry
     response = client.post(root, headers=headers, json={**request, "confirm_publication": False})
     assert response.status_code == 422
-    search_request, statement = public_search()
+    search_request, statement = public_search(side["label"])
     peer = Peer("own", "https://node.example.test", receipt_signer.node_id, receipt_signer.public_key_b64)
     result = verify_statement(statement, peer, search_request, VOCABULARY)
     item = next(e for e in result["entries"] if e["publicationId"] == publication["id"])
@@ -142,6 +147,7 @@ def test_publication_pages_cover_the_whole_organization_and_scope_the_cursor(con
 def test_stale_or_revoked_publications_vanish_and_old_consent_cannot_republish(connected, change):
     headers, _, side, root = connected
     publication, request, _ = preview_and_publish(connected)
+    assert any(e["publicationId"] == publication["id"] for e in public_search(side["label"])[1]["payload"]["entries"])
     with SessionLocal() as db:
         claim = db.get(AuthorityClaimRecord, side["authority"]["id"])
         if change == "policy":
@@ -152,20 +158,21 @@ def test_stale_or_revoked_publications_vanish_and_old_consent_cannot_republish(c
         if change == "revocation": claim.status = "revoked"
         if change == "territory": claim.territory = "CA"
         db.commit()
-    assert not any(e["publicationId"] == publication["id"] for e in public_search()[1]["payload"]["entries"])
+    assert not any(e["publicationId"] == publication["id"] for e in public_search(side["label"])[1]["payload"]["entries"])
     assert client.post(root, headers=headers, json=request).status_code == 409
     assert client.get(root, headers=headers).json()["publications"][0]["status"] == "needs_review"
 
 
 def test_withdrawal_clears_public_fields_and_requires_new_consent_to_republish(connected):
-    headers, _, _, root = connected
+    headers, _, side, root = connected
     publication, request, _ = preview_and_publish(connected)
+    assert any(e["publicationId"] == publication["id"] for e in public_search(side["label"])[1]["payload"]["entries"])
     url = f"{root}/{publication['id']}/withdraw"
     assert client.post(url, headers=headers, json={"expected_revision": 2}).status_code == 409
     withdrawn = client.post(url, headers=headers, json={"expected_revision": 1})
     assert withdrawn.status_code == 200 and withdrawn.json()["publicFields"] == {}
     assert client.post(url, headers=headers, json={"expected_revision": 1}).status_code == 200
-    assert not any(e["publicationId"] == publication["id"] for e in public_search()[1]["payload"]["entries"])
+    assert not any(e["publicationId"] == publication["id"] for e in public_search(side["label"])[1]["payload"]["entries"])
     assert client.post(root, headers=headers, json=request).status_code == 409
     republished, _, _ = preview_and_publish(connected)
     assert republished["revision"] == 2 and republished["status"] == "published"
@@ -267,14 +274,15 @@ def test_oversized_or_ambiguous_json_fails_closed(http_peer, body):
 
 def test_peer_failure_keeps_local_results_and_reports_partial(connected, monkeypatch):
     import federation_routes
-    headers, _, _, _ = connected
+    headers, _, side, _ = connected
+    label = side["label"]
     publication, _, _ = preview_and_publish(connected)
     peer = Peer("unavailable", "https://offline.example.test", "urn:offline", receipt_signer.public_key_b64)
     monkeypatch.setattr(app.state, "federation_config", FederationConfig(True, "https://node.example.test", (peer,)))
     async def unavailable(peer, *args, **kwargs):
         return {"id": peer.id, "nodeId": peer.node_id, "origin": peer.origin, "status": "timeout", "entries": []}
     monkeypatch.setattr(federation_routes, "query_peer", unavailable)
-    result = client.post("/v1/federation/search", headers=headers, json={"query": "Paper Skies"}).json()
+    result = client.post("/v1/federation/search", headers=headers, json={"query": label}).json()
     assert result["partial"] is True
     assert any(r["entry"]["publicationId"] == publication["id"] for r in result["results"])
     assert result["sources"][-1]["status"] == "timeout"

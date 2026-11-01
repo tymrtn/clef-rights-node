@@ -57,6 +57,13 @@ def test_quoted_text_and_unrelated_locations_cannot_supply_the_api_proxy(web_fil
     assert any("/api/" in error for error in verifier.web_file_errors(nginx, dockerfile))
 
 
+def test_peer_facing_federation_routes_must_reach_the_api(web_files):
+    nginx, dockerfile = web_files
+    start = nginx.index("  location ~ ^/(v1/federation/")
+    end = nginx.index("  location /assets/ {")
+    assert any("federation" in error for error in verifier.web_file_errors(nginx[:start] + nginx[end:], dockerfile))
+
+
 def test_location_cannot_override_the_server_private_origin(web_files):
     nginx, dockerfile = web_files
     nginx = nginx.replace("location /api/ {", 'location /api/ {\n    set $api_upstream "http://wrong-origin";')

@@ -1,6 +1,6 @@
 import datetime
 import uuid
-from typing import Optional, List, Dict, Any
+from typing import Callable, Optional, List, Dict, Any
 from copy import deepcopy
 import csv
 import io
@@ -173,6 +173,7 @@ async def production_legacy_boundary(request: Request, call_next):
         or path.startswith("/redoc")
         or path.startswith("/auth/")
         or path.startswith("/v1/")
+        or path == "/.well-known/clef-node"
     )
     if not allowed:
         return JSONResponse(
@@ -4434,6 +4435,12 @@ def _permission_request_actor_payload(
             "credentialName": credential.name if credential else None,
             "organizationId": permission.requester_org_id,
         }
+    if permission.requested_by_peer_node_id:
+        return {
+            "type": "federated_peer",
+            "nodeId": permission.requested_by_peer_node_id,
+            "organizationId": permission.requester_org_id,
+        }
     return {
         "type": "organization_member",
         "userId": permission.requested_by_user_id,
@@ -5968,6 +5975,8 @@ def create_organization(
     slug = req.slug.strip().lower()
     if not slug or not all(char.isalnum() or char in {"-", "_"} for char in slug):
         raise HTTPException(status_code=422, detail="Organization slug must use letters, numbers, hyphens, or underscores")
+    if slug.startswith("peer-"):
+        raise HTTPException(status_code=422, detail="The peer- prefix is reserved for organizations represented from other nodes")
     organization_type = req.organization_type.strip().lower()
     if organization_type not in ORGANIZATION_TYPES:
         raise HTTPException(status_code=422, detail="Unsupported organization type")
@@ -7333,91 +7342,134 @@ def create_permission_request(
             org_id=req.requester_org_id,
             required_scope="permissions:request" if principal.credential else None,
         )
-        if req.intended_usage not in USAGE_KEYS:
-            raise HTTPException(status_code=422, detail="Unsupported intended usage")
-        claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == req.authority_claim_id).with_for_update().first()
-        if not claim or claim.status != "verified":
-            raise HTTPException(status_code=409, detail="A verified authority claim is required")
-        if not req.term_start or not req.term_end:
-            raise HTTPException(status_code=422, detail="License start and end dates are required")
-        try:
-            term_start = datetime.date.fromisoformat(req.term_start)
-            term_end = datetime.date.fromisoformat(req.term_end)
-        except ValueError as error:
-            raise HTTPException(status_code=422, detail="License dates must use YYYY-MM-DD") from error
-        if term_end < term_start:
-            raise HTTPException(status_code=422, detail="License end date cannot precede the start date")
-        contract = db.query(RightsContractRecord).filter(RightsContractRecord.id == claim.rights_contract_id).with_for_update().first()
-        if not contract:
-            raise HTTPException(status_code=409, detail="Authority policy is unavailable")
-        policy_state, policy_reasons = _checked_permission_policy(
-            claim, contract,
+        return _submit_permission_request(
+            db,
+            requester_org_id=req.requester_org_id,
+            authority_claim_id=req.authority_claim_id,
             intended_usage=req.intended_usage,
             territory=req.territory,
-            context=req.context,
-        )
-        request_context = deepcopy(req.context)
-        request_context["policyEvaluation"] = {"state": policy_state, "reasons": policy_reasons}
-        permission = PermissionRequestRecord(
-            requester_org_id=req.requester_org_id,
-            authority_claim_id=claim.id,
-            work_key=claim.work_key,
-            intended_usage=req.intended_usage,
-            territory=",".join(sorted(_territory_codes(req.territory))),
             term_start=req.term_start,
             term_end=req.term_end,
-            context=request_context,
+            context=req.context,
             provenance=req.provenance,
-            license_obligations=_empty_license_obligations(),
-            status="pending",
-            requested_by_user_id=principal.user.id if principal.user else None,
-            requested_by_api_credential_id=principal.credential.id if principal.credential else None,
-            requested_at=datetime.datetime.utcnow(),
+            principal=principal,
         )
-        db.add(permission)
-        db.flush()
-        for org_id in {req.requester_org_id, claim.org_id}:
+
+
+def _submit_permission_request(
+    db: Session,
+    *,
+    requester_org_id: str,
+    authority_claim_id: str,
+    intended_usage: str,
+    territory: str,
+    term_start: Optional[str],
+    term_end: Optional[str],
+    context: Dict[str, Any],
+    provenance: Dict[str, Any],
+    principal: Optional[V1Principal] = None,
+    peer_node_id: Optional[str] = None,
+    bind_record: Optional[Callable[[PermissionRequestRecord], None]] = None,
+) -> Dict[str, Any]:
+    """Evaluate and record a request; the caller holds the authority write lock.
+
+    Exactly one requester is named: a local principal or a configured peer node.
+    bind_record adds rows that must commit in the same transaction as the request.
+    """
+    if (principal is None) == (peer_node_id is None):
+        raise RuntimeError("A permission request needs exactly one requesting actor")
+    if intended_usage not in USAGE_KEYS:
+        raise HTTPException(status_code=422, detail="Unsupported intended usage")
+    claim = db.query(AuthorityClaimRecord).filter(AuthorityClaimRecord.id == authority_claim_id).with_for_update().first()
+    if not claim or claim.status != "verified":
+        raise HTTPException(status_code=409, detail="A verified authority claim is required")
+    if not term_start or not term_end:
+        raise HTTPException(status_code=422, detail="License start and end dates are required")
+    try:
+        start_date = datetime.date.fromisoformat(term_start)
+        end_date = datetime.date.fromisoformat(term_end)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="License dates must use YYYY-MM-DD") from error
+    if end_date < start_date:
+        raise HTTPException(status_code=422, detail="License end date cannot precede the start date")
+    contract = db.query(RightsContractRecord).filter(RightsContractRecord.id == claim.rights_contract_id).with_for_update().first()
+    if not contract:
+        raise HTTPException(status_code=409, detail="Authority policy is unavailable")
+    policy_state, policy_reasons = _checked_permission_policy(
+        claim, contract,
+        intended_usage=intended_usage,
+        territory=territory,
+        context=context,
+    )
+    request_context = deepcopy(context)
+    request_context["policyEvaluation"] = {"state": policy_state, "reasons": policy_reasons}
+    permission = PermissionRequestRecord(
+        requester_org_id=requester_org_id,
+        authority_claim_id=claim.id,
+        work_key=claim.work_key,
+        intended_usage=intended_usage,
+        territory=",".join(sorted(_territory_codes(territory))),
+        term_start=term_start,
+        term_end=term_end,
+        context=request_context,
+        provenance=provenance,
+        license_obligations=_empty_license_obligations(),
+        status="pending",
+        requested_by_user_id=principal.user.id if principal and principal.user else None,
+        requested_by_api_credential_id=principal.credential.id if principal and principal.credential else None,
+        requested_by_peer_node_id=peer_node_id,
+        requested_at=datetime.datetime.utcnow(),
+    )
+    db.add(permission)
+    db.flush()
+    if bind_record:
+        bind_record(permission)
+    details: Dict[str, Any] = {
+        "authorityClaimId": claim.id,
+        "workKey": claim.work_key,
+        "intendedUsage": intended_usage,
+        "policyState": policy_state,
+    }
+    if peer_node_id:
+        details["peerNodeId"] = peer_node_id
+    for org_id in {requester_org_id, claim.org_id}:
+        _record_v1_audit(
+            db,
+            org_id=org_id,
+            principal=principal,
+            actor_type=None if principal else "federated_peer",
+            action="permission_request.created",
+            resource_type="permission_request",
+            resource_id=permission.id,
+            details=details,
+        )
+    response: Dict[str, Any] = {"id": permission.id, "status": permission.status, "policyState": policy_state}
+    if policy_state == "allowed":
+        permission.status = "approved"
+        permission.decided_at = datetime.datetime.utcnow()
+        permission.decision_note = "Automatically approved by the published rights policy"
+        for org_id in {permission.requester_org_id, claim.org_id}:
             _record_v1_audit(
                 db,
                 org_id=org_id,
-                principal=principal,
-                action="permission_request.created",
+                actor_type="policy",
+                action="permission_request.approved",
                 resource_type="permission_request",
                 resource_id=permission.id,
-                details={
-                    "authorityClaimId": claim.id,
-                    "workKey": claim.work_key,
-                    "intendedUsage": req.intended_usage,
-                    "policyState": policy_state,
-                },
+                details={"contractId": contract.id, "policyVersion": contract.version},
             )
-        response: Dict[str, Any] = {"id": permission.id, "status": permission.status, "policyState": policy_state}
-        if policy_state == "allowed":
-            permission.status = "approved"
-            permission.decided_at = datetime.datetime.utcnow()
-            permission.decision_note = "Automatically approved by the published rights policy"
-            for org_id in {permission.requester_org_id, claim.org_id}:
-                _record_v1_audit(
-                    db,
-                    org_id=org_id,
-                    actor_type="policy",
-                    action="permission_request.approved",
-                    resource_type="permission_request",
-                    resource_id=permission.id,
-                    details={"contractId": contract.id, "policyVersion": contract.version},
-                )
-            receipt = _issue_permission_receipt(
-                db,
-                permission=permission,
-                claim=claim,
-                contract=contract,
-                decision_actor={"type": "policy", "contractId": contract.id, "version": contract.version},
-            )
-            response.update({"status": "approved", "receipt": _serialize_receipt(receipt)})
-        else:
-            db.commit()
-            db.refresh(permission)
-        return response
+        receipt = _issue_permission_receipt(
+            db,
+            permission=permission,
+            claim=claim,
+            contract=contract,
+            decision_actor={"type": "policy", "contractId": contract.id, "version": contract.version},
+        )
+        response.update({"status": "approved", "receipt": _serialize_receipt(receipt)})
+    else:
+        db.commit()
+        db.refresh(permission)
+    return response
 
 
 @app.post("/v1/permission-requests/{permission_id}/decide")
@@ -10095,15 +10147,39 @@ def get_permission_receipt(
     return _serialize_receipt(row)
 
 
+def _recognized_receipt_signer(receipt: Dict[str, Any]) -> Optional[str]:
+    """This node or a configured peer, matched by both pinned key and node ID."""
+    proof = receipt.get("proof") if isinstance(receipt, dict) else None
+    payload = receipt.get("payload") if isinstance(receipt, dict) else None
+    key = proof.get("publicKey") if isinstance(proof, dict) else None
+    node = payload.get("node") if isinstance(payload, dict) else None
+    node_id = node.get("id") if isinstance(node, dict) else None
+    if node_id == receipt_signer.node_id:
+        if key == receipt_signer.public_key_b64:
+            return "this_node"
+        if key in {item.strip() for item in settings.NODE_RETIRED_SIGNING_PUBLIC_KEYS_B64.split(",") if item.strip()}:
+            return "this_node_retired_key"
+    for peer in app.state.federation_config.peers:
+        if key in (*peer.keys, *peer.retired_keys) and node_id == peer.node_id:
+            return f"peer:{peer.id}"
+    return None
+
+
 @app.post("/v1/receipts/verify")
 def verify_permission_receipt(req: ReceiptVerifyRequest):
     result = ReceiptSigner.verify_receipt(req.receipt)
+    # A self-consistent signature proves only that some key signed it; trust needs a known signer.
+    signer = _recognized_receipt_signer(req.receipt)
+    error = result.error
+    if result.valid and not signer:
+        error = "Signed by a key this node does not recognize. Establish the issuing node's key before relying on it."
     return {
-        "valid": result.valid,
+        "valid": result.valid and signer is not None,
         "payloadHashValid": result.payload_hash_valid,
         "signatureValid": result.signature_valid,
         "transparencyHashValid": result.transparency_hash_valid,
-        "error": result.error,
+        "signer": signer,
+        "error": error,
     }
 
 
@@ -10169,12 +10245,19 @@ register_authority_withdrawal(
     app, get_db=get_db, require_user=_require_session_user, require_membership=_require_membership,
     audit=_record_v1_audit, write_lock=_authority_write_lock,
 )
-register_federation_routes(
+catalog_publications = register_federation_routes(
     app, settings=settings, signer=receipt_signer, get_db=get_db, require_user=_require_session_user,
     require_membership=_require_membership, require_principal=_require_v1_principal,
     audit=_record_v1_audit, write_lock=_transparency_write_lock, default_ai_policy=default_ai_policy,
     vocabulary={"usage": USAGE_KEYS, "restrictions": RESTRICTION_KEYS, "inputs": AI_INPUT_KEYS,
                 "modelScopes": AI_MODEL_SCOPE_KEYS, "limits": AI_LIMIT_KEYS, "safeguards": AI_SAFEGUARD_KEYS},
+)
+from federated_requests import register_federated_request_routes
+register_federated_request_routes(
+    app, signer=receipt_signer, get_db=get_db, require_principal=_require_v1_principal,
+    require_principal_org=_require_principal_organization, submit_request=_submit_permission_request,
+    serialize_receipt=_serialize_receipt, write_lock=_authority_write_lock,
+    current_publication=catalog_publications.current_payload,
 )
 register_sandbox_tour(
     app, settings=settings, get_db=get_db, require_user=_require_session_user,

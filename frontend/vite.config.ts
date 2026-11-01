@@ -19,6 +19,10 @@ export default defineConfig({
         target: process.env.VITE_API_PROXY_TARGET || "http://localhost:9247",
         changeOrigin: true,
       },
+      "/.well-known/clef-node": {
+        target: process.env.VITE_API_PROXY_TARGET || "http://localhost:9247",
+        changeOrigin: true,
+      },
     },
   },
   build: {

@@ -1,5 +1,6 @@
 import React from "react";
 import { USAGE_CATEGORIES, RESTRICTION_CATEGORIES } from "../types/rights";
+import { RequestScopeFields, initialRequestScope, requestScopeComplete, requestScopeContext, type RequestScope } from "./RequestScope";
 import "./ConnectedCatalogs.css";
 
 type PublicEntry = {
@@ -16,6 +17,13 @@ type SearchResult = { query: string; checkedAt: number; partial: boolean; trunca
 type Publication = { id: string; authorityClaimId: string; revision: number; status: string; publicFields: PublicEntry | Record<string, never> };
 type Preview = { publicFields: PublicEntry; previewDigest: string; distribution: string; freshnessSeconds: number };
 type Claim = { id: string; workKey: string; rightType: string; territory: string; status: string };
+type ResultSource = SearchResult["results"][number]["source"];
+type OutboundRequest = { id: string; sourceId: string; sourceNodeId: string; sourceOrigin: string; publicationId: string;
+  requesterOrgId: string; status: string; remotePermissionId: string | null; receipts: unknown[]; decisionNote: string | null;
+  decidedAt: string | null; policyState: string | null; createdAt: string; refreshedAt: string | null };
+type LocalRequest = { source: "local"; id: string; status: string; policyState: string; receipt?: unknown };
+type Draft = { key: string; organizationId: string; usage: string; territory: string; termStart: string; termEnd: string };
+type Outcome = { key: string; organizationId: string; status: string; local: boolean; receipt?: unknown };
 
 const labels: Record<string, string> = {
   ...Object.fromEntries([...Object.values(USAGE_CATEGORIES), ...Object.values(RESTRICTION_CATEGORIES)].map(category => [category.id, category.title])),
@@ -40,6 +48,15 @@ const labels: Record<string, string> = {
   needs_review: "Changed · review before sharing", withdrawn: "Withdrawn",
 };
 const label = (value: string) => labels[value] || value.replace(/_/g, " ");
+const requestStatusText: Record<string, string> = {
+  pending: "Waiting for the source's decision", approved: "Approved by the source, signed receipt received",
+  rejected: "Declined by the source", unconfirmed: "Not confirmed — refresh to retry", sending: "Not confirmed — refresh to retry",
+  not_received: "The source has no record of this request", not_accepted: "The source did not accept the request",
+};
+const requestStatus = (status: string) => requestStatusText[status] || status.charAt(0).toUpperCase() + status.slice(1).replace(/_/g, " ");
+const requestTone = (status: string) => status === "approved" ? "connected-success" : status === "pending" || status === "corrected" ? "connected-pending" : "connected-warning";
+const requestableUses = (entry: PublicEntry) => Object.entries(entry.policy.usage).filter(([, state]) => state !== "blocked");
+const requiredSafeguards = (entry: PublicEntry) => Object.entries(entry.policy.safeguards || {}).filter(([, required]) => required === true).map(([key]) => key);
 const errorText = (error: unknown) => error instanceof Error ? error.message : "Please try again.";
 
 function download(value: unknown, name: string) {
@@ -57,8 +74,8 @@ function PolicyDetails({ entry }: { entry: PublicEntry }) {
   </details>;
 }
 
-export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, canPublish, synthetic = false }: {
-  apiBase?: string; sessionId: string; organizationId: string; canPublish: boolean; synthetic?: boolean;
+export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, organizations, canPublish, synthetic = false }: {
+  apiBase?: string; sessionId: string; organizationId: string; organizations: { id: string; name: string }[]; canPublish: boolean; synthetic?: boolean;
 }) {
   const [query, setQuery] = React.useState(synthetic ? "Paper Skies" : "");
   const [result, setResult] = React.useState<SearchResult | null>(null);
@@ -74,13 +91,24 @@ export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, can
   const [confirmed, setConfirmed] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [now, setNow] = React.useState(Date.now());
+  const [draft, setDraft] = React.useState<Draft | null>(null);
+  const [requestScope, setRequestScope] = React.useState<RequestScope>(initialRequestScope);
+  const [requestError, setRequestError] = React.useState("");
+  const [outcome, setOutcome] = React.useState<Outcome | null>(null);
+  const [sending, setSending] = React.useState(false);
+  const [sent, setSent] = React.useState<OutboundRequest[]>([]);
+  const [sentError, setSentError] = React.useState("");
+  const [refreshing, setRefreshing] = React.useState("");
   const busyRef = React.useRef(false);
+  const sendingRef = React.useRef(false);
   const searchSequence = React.useRef(0);
   const scope = `${sessionId}:${organizationId}`;
   const currentScope = React.useRef(scope); currentScope.current = scope;
   const alive = React.useRef(true);
   const searchAbort = React.useRef<AbortController | null>(null);
   const root = `/v1/organizations/${encodeURIComponent(organizationId)}/catalog/publications`;
+  const inScope = () => alive.current && currentScope.current === scope;
+  const organizationName = (id: string) => organizations.find(organization => organization.id === id)?.name || id;
 
   async function api<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     const response = await fetch(`${apiBase.replace(/\/$/, "")}${path}`, {
@@ -105,10 +133,16 @@ export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, can
     }
   }
 
+  async function loadSent() {
+    const data = await api<{ requests: OutboundRequest[] }>(`/v1/organizations/${encodeURIComponent(organizationId)}/federation/permission-requests`);
+    if (inScope()) setSent(data.requests);
+  }
+
   React.useEffect(() => {
     alive.current = true;
     let cancelled = false;
     if (canPublish) void loadPublications().catch(caught => { if (!cancelled) setPublicationError(errorText(caught)); });
+    void loadSent().catch(caught => { if (!cancelled) setSentError(errorText(caught)); });
     const timer = setInterval(() => setNow(Date.now()), 5000);
     return () => { cancelled = true; alive.current = false; clearInterval(timer); searchAbort.current?.abort(); searchSequence.current++; };
   }, [scope, canPublish]);
@@ -119,7 +153,7 @@ export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, can
     const sequence = ++searchSequence.current;
     searchAbort.current?.abort();
     const controller = new AbortController(); searchAbort.current = controller;
-    setSearching(true); setError(""); setResult(null);
+    setSearching(true); setError(""); setResult(null); setDraft(null); setOutcome(null); setRequestError("");
     try {
       const data = await api<SearchResult>("/v1/federation/search", { query: query.trim(), limit: 20 }, controller.signal);
       if (alive.current && currentScope.current === scope && sequence === searchSequence.current) { setResult(data); setNow(Date.now()); }
@@ -158,6 +192,87 @@ export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, can
     });
   }
 
+  function openRequest(entry: PublicEntry, key: string) {
+    const scope = initialRequestScope();
+    // Never preselect source material that the published policy blocks.
+    setOutcome(null); setRequestError(""); setRequestScope({ ...scope, inputAssets: scope.inputAssets.filter(asset => entry.policy.inputs?.[asset] !== "blocked") });
+    setDraft(draft?.key === key ? null : { key, organizationId, usage: requestableUses(entry)[0][0], territory: entry.territory, termStart: "", termEnd: "" });
+  }
+
+  async function sendRequest(event: React.FormEvent, entry: PublicEntry, source: ResultSource) {
+    event.preventDefault();
+    if (!draft || sendingRef.current || !requestScopeComplete(requestScope, draft.usage, requiredSafeguards(entry))) return;
+    const exact = draft;
+    sendingRef.current = true; setSending(true); setRequestError(""); setOutcome(null);
+    try {
+      const data = await api<OutboundRequest | LocalRequest>("/v1/federation/permission-requests", {
+        source_id: source.id, publication_id: entry.publicationId, requester_org_id: exact.organizationId,
+        intended_usage: exact.usage, territory: exact.territory.trim(), term_start: exact.termStart, term_end: exact.termEnd, context: requestScopeContext(requestScope, exact.usage),
+      });
+      if (inScope()) { setDraft(null); setOutcome({ key: exact.key, organizationId: exact.organizationId, status: data.status, local: source.id === "local", receipt: "receipt" in data ? data.receipt : undefined }); }
+    } catch (caught) {
+      if (inScope()) setRequestError(errorText(caught));
+    } finally {
+      sendingRef.current = false;
+      if (inScope()) setSending(false);
+    }
+    // This node records a peer request before sending it, so a refused or unverified send still has a row to show.
+    if (source.id !== "local") await loadSent().catch(caught => { if (inScope()) setSentError(errorText(caught)); });
+  }
+
+  async function refreshRequest(id: string) {
+    if (refreshing) return;
+    setRefreshing(id); setSentError("");
+    try {
+      const row = await api<OutboundRequest>(`/v1/federation/permission-requests/${encodeURIComponent(id)}/refresh`, {});
+      if (inScope()) setSent(rows => rows.map(existing => existing.id === row.id ? row : existing));
+    } catch (caught) {
+      if (inScope()) setSentError(errorText(caught));
+      // A refused or unverifiable answer can still change the stored status.
+      await loadSent().catch(reload => { if (inScope()) setSentError(message => `${message} ${errorText(reload)}`); });
+    } finally {
+      if (inScope()) setRefreshing("");
+    }
+  }
+
+  function requestTerms(entry: PublicEntry, source: ResultSource, key: string, index: number) {
+    const uses = requestableUses(entry);
+    if (!uses.length) return null;
+    const open = draft?.key === key;
+    const formId = `connected-request-${index}`;
+    const edit = (change: Partial<Draft>) => setDraft(previous => previous && { ...previous, ...change });
+    return <div className="connected-request">
+      <button type="button" aria-expanded={open} aria-controls={open ? formId : undefined} onClick={() => openRequest(entry, key)}>Request terms</button>
+      {outcome?.key === key && <div role="status" className={requestTone(outcome.status)}><strong>{requestStatus(outcome.status)}</strong>
+        <p>{outcome.local ? `Follow it in the Permission ledger${outcome.organizationId === organizationId ? "" : ` for ${organizationName(outcome.organizationId)}`}.`
+          : outcome.organizationId === organizationId ? "Listed under Sent requests below." : `Listed under Sent requests for ${organizationName(outcome.organizationId)}.`}</p>
+        {outcome.receipt !== undefined && <button type="button" onClick={() => download(outcome.receipt, `clef-receipt-${entry.publicationId}.json`)}>Download receipt JSON</button>}</div>}
+      {open && draft && <form id={formId} className="connected-request-form" aria-label={`Request terms for ${entry.workTitle}`} onSubmit={event => void sendRequest(event, entry, source)}>
+        <p className="connected-note">{source.id === "local"
+          ? "This entry is published on this node. Its organization decides the request under its own published policy, and a person reviews any use that requires approval. Sending a request grants no license."
+          : `This node signs the request and sends it to ${source.origin}. That node decides it under its own published policy, and a person there reviews any use that requires approval. Your session and credentials stay on this node. Sending a request grants no license.`}</p>
+        <div><label htmlFor="request-organization">Requesting organization</label>
+          <select id="request-organization" value={draft.organizationId} disabled={sending} onChange={event => edit({ organizationId: event.target.value })}>
+            {organizations.map(organization => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select></div>
+        <div><label htmlFor="request-usage">Intended use</label>
+          <select id="request-usage" value={draft.usage} disabled={sending} onChange={event => edit({ usage: event.target.value })}>
+            {uses.map(([use, state]) => <option key={use} value={use}>{`${label(use)} · ${state === "allowed" ? "allowed, decided by the published policy" : "requires approval, reviewed by a person at the source"}`}</option>)}</select></div>
+        <div><label htmlFor="request-territory">Territory</label>
+          <input id="request-territory" required maxLength={500} value={draft.territory} disabled={sending} onChange={event => edit({ territory: event.target.value })} /></div>
+        <div className="connected-request-dates">
+          <div><label htmlFor="request-term-start">Term start</label><input id="request-term-start" type="date" required value={draft.termStart} disabled={sending} onChange={event => edit({ termStart: event.target.value })} /></div>
+          <div><label htmlFor="request-term-end">Term end</label><input id="request-term-end" type="date" required min={draft.termStart || undefined} value={draft.termEnd} disabled={sending} onChange={event => edit({ termEnd: event.target.value })} /></div>
+        </div>
+        <RequestScopeFields usage={draft.usage} value={requestScope} onChange={setRequestScope} label={label} requiredSafeguards={requiredSafeguards(entry)} policy={entry.policy} />
+        {requestError && <p role="alert" className="connected-error">{requestError}</p>}
+        <div className="connected-request-actions">
+          <button type="submit" disabled={sending || !draft.territory.trim() || !draft.termStart || !draft.termEnd || !requestScopeComplete(requestScope, draft.usage, requiredSafeguards(entry))}>{sending ? "Sending…" : source.id === "local" ? "Send request" : "Sign and send request"}</button>
+          <button type="button" disabled={sending} onClick={() => { setDraft(null); setRequestError(""); }}>Cancel</button>
+        </div>
+      </form>}
+    </div>;
+  }
+
   const expired = result?.sources.some(source => source.expiresAt && source.expiresAt * 1000 <= now);
   return <div className="connected-catalogs">
     <header className="connected-intro"><p className="connected-eyebrow">Catalog discovery</p><h1>Search connected catalogs.</h1>
@@ -180,19 +295,37 @@ export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, can
       {result.truncated && <p className="connected-warning">More entries may be available. Narrow your search by identifier or catalog name.</p>}
       {expired && <p role="status" className="connected-warning">One or more source statements have expired. Search again to refresh those catalog results.</p>}
       {!result.results.length && <p>No published entries matched this search. An organization can share a verified catalog entry using the publication controls below.</p>}
-      <div className="connected-records">{result.results.map(({ entry, source }) => <article key={`${source.nodeId}:${entry.publicationId}`} aria-label={`${entry.organization.name} catalog result`}>
+      <div className="connected-records">{result.results.map(({ entry, source }, index) => <article key={`${source.nodeId}:${entry.publicationId}`} aria-label={`${entry.organization.name} catalog result`}>
         <div className="connected-record-kind"><span>{label(entry.rightType)}</span><span>{entry.territory}</span></div>
         <h3>{entry.workTitle}</h3><p className="connected-artist">{entry.artistName}</p><p className="connected-owner">Published by <strong>{entry.organization.name}</strong></p>
         <dl className="connected-identifiers">{Object.entries(entry.catalogReferences).filter(([, value]) => value).map(([key, value]) => <div key={key}><dt>{key.toUpperCase()}</dt><dd>{value}</dd></div>)}</dl>
         <div className="connected-uses">{Object.entries(entry.policy.usage).filter(([, state]) => state !== "blocked").map(([use]) => <span key={use}>{label(use)}</span>)}</div>
         <p className="connected-note">Catalog references supplied by this organization. Its reviewer checks the requested use, scope and terms.</p>
         <PolicyDetails entry={entry} />
+        {requestTerms(entry, source, `${source.nodeId}:${entry.publicationId}`, index)}
         <footer><span className="connected-freshness">{source.expiresAt * 1000 <= now ? "Expired · search again" : `Current until ${new Date(source.expiresAt * 1000).toLocaleTimeString()}`}</span><span>Policy {entry.policyVersion} · publication {entry.publicationRevision}{entry.synthetic ? " · fictional" : ""}</span><code>{source.nodeId}</code></footer>
       </article>)}</div>
       <details className="connected-proof"><summary>Inspect the source statements</summary><p>Each statement binds the search, published fields, source node and expiry. This node checks remote signatures against the operator’s configured peer keys.</p>
         {result.sources.filter(source => source.statement).map(source => <button key={source.id} onClick={() => download(source.statement, `clef-discovery-${source.id}.json`)}>Download {source.id === "local" ? "this node’s" : source.id} statement</button>)}
       </details>
     </section>}
+    <section className="connected-sent" aria-label="Sent requests"><p className="connected-eyebrow">Your organization’s requests</p><h2>Sent requests</h2>
+      <p>Requests this organization sent to connected catalogs, newest first. Each status is the source node’s signed answer. Refresh asks the source again.</p>
+      {sentError && <p role="alert" className="connected-error">{sentError}</p>}
+      {!sent.length && !sentError && <p className="connected-note">This organization has not sent a request to a connected catalog.</p>}
+      {!!sent.length && <div className="connected-sent-list">{sent.map(request => <article key={request.id} aria-label={`Request to ${request.sourceOrigin} for ${request.publicationId}`}>
+        <div><strong className={`connected-request-status ${requestTone(request.status)}`}>{requestStatus(request.status)}</strong>
+          <dl>
+            <div><dt>Source</dt><dd>{request.sourceOrigin}</dd></div>
+            <div><dt>Catalog entry</dt><dd><code>{request.publicationId}</code></dd></div>
+            <div><dt>Decided</dt><dd>{request.decidedAt ? new Date(request.decidedAt).toLocaleString() : "No decision yet"}</dd></div>
+            <div><dt>Receipts</dt><dd>{`${request.receipts.length} signed ${request.receipts.length === 1 ? "receipt" : "receipts"}`}</dd></div>
+          </dl>
+          {request.decisionNote && <p className="connected-decision-note">{`Source’s note: ${request.decisionNote}`}</p>}</div>
+        <div className="connected-sent-actions"><button disabled={!!refreshing} onClick={() => void refreshRequest(request.id)}>{refreshing === request.id ? "Asking the source…" : "Refresh status"}</button>
+          {request.receipts.map((receipt, index) => <button key={index} onClick={() => download(receipt, `clef-receipt-${request.id}-${index + 1}.json`)}>{request.receipts.length === 1 ? "Download receipt JSON" : `Download receipt ${index + 1} JSON`}</button>)}</div>
+      </article>)}</div>}
+    </section>
     {canPublish && <section className="connected-publish" aria-label="Publish your catalog"><p className="connected-eyebrow">Your organization's choice</p><h2>Choose what buyers can find.</h2>
       <p>Review the exact public fields before sharing. Agreements, evidence and commercial terms stay in the organization’s private records. Policy or authority changes require a fresh publication review.</p>
       {publicationError && <p role="alert" className="connected-error">{publicationError}</p>}{notice && <p role="status" className="connected-success">{notice}</p>}
