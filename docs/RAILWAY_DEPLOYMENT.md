@@ -62,6 +62,18 @@ VITE_DEMO_MODE=false
 
 `API_UPSTREAM` is consumed at container startup, so the same web image can move between staging and production without rebuilding against a public API URL.
 
+## Federation variables
+
+Federation is optional. To join configured peers, set these on the API service and keep the rest of the federation section of `env.sample` at its defaults:
+
+```dotenv
+FEDERATION_ENABLED=true
+FEDERATION_PUBLIC_ORIGIN=https://<web-domain>
+FEDERATION_PEERS_JSON=[...entries printed by scripts/federation_peer.py...]
+```
+
+The web image routes the peer-facing paths (`/v1/federation/catalog/search`, `/v1/federation/inbound/`, `/v1/public/catalog/`, `/.well-known/clef-node`) to the API, so the public web domain is the federation origin. Restart the API after changing peers.
+
 ## Connectors
 
 Start the pilot with `DDEX_ENABLED=false` and `DDEX_LIVE_MESSAGES=false`. Enable test MWL export only after the operating entity accepts the free DDEX Implementation Licence, obtains its DPID, installs the pinned official schemas into the deployment image or a controlled read-only mount, and configures a willing counterparty's DPID and test profile.
@@ -72,7 +84,7 @@ MLC credentials belong only in Railway's secret store. Enable `catalog_lookup` a
 
 1. Run `make verify-alpha` and review the [upgrade notes](../CHANGELOG.md#unreleased). Preserve a recoverable database backup, the persistent signing/encryption keys, and the previous release configuration before migrating.
 2. After release approval, commit the reviewed package and publish its corresponding source. Use the full commit hash for `SOURCE_CODE_REVISION` and an exact matching source URL for `SOURCE_CODE_URL` in the API and workers. Build the console from the same commit.
-3. Pause application writes and outbound workers for the maintenance window. Apply `alembic upgrade head` using the candidate image, then run `alembic current` and `alembic check`. This candidate requires `0020_catalog_review_basis`, following the receipt-privacy, prepared-walkthrough and federation migrations. Catalog API clients must send `expected_preview_digest` for resolution, refresh and commit; see QUICKSTART.md. Start the matching API, workers, then web. Keep the API and workers off public networking. Federation remains disabled until the operator configures HTTPS peer origins, verifies their signing keys and reviews publication consent.
+3. Pause application writes and outbound workers for the maintenance window. Apply `alembic upgrade head` using the candidate image, then run `alembic current` and `alembic check`. This candidate requires `0021_federated_requests`, following the receipt-privacy, prepared-walkthrough, federation and catalog-review migrations. Catalog API clients must send `expected_preview_digest` for resolution, refresh and commit; see QUICKSTART.md. Start the matching API, workers, then web. Keep the API and workers off public networking. Federation remains disabled until the operator configures HTTPS peer origins, verifies their signing keys and reviews publication consent; see [connected catalogs](foundation/CATALOG_FEDERATION.md#configuration).
 4. Confirm `/health`, `/v1/node/info`, magic-link delivery, database migration head, database-backed worker heartbeats, and signed node identity. Sign in as a configured operator and open **Operator review → Deployment readiness**; every required check must be green.
 5. Run `scripts/verify_release.py --api-url <api-origin> --source-dir <clean-checkout> --expected-revision <revision> --require-clean --require-source-reachable`. The declared source URL must resolve publicly and name the full Git commit hash. The verifier compares the public archive with every tracked file and file mode in that local commit, and includes the archive digest in its JSON report.
 6. Complete the browser acceptance flow in `LAUNCH_CHECKLIST.md` with one controlled catalog.
@@ -92,7 +104,7 @@ Railway volume snapshots restore within the same project and environment. Restor
 
 Record the known-good deployment for each application service and confirm its recovery action is available before upgrading. Railway's dashboard rollback restores a retained image and its custom variables; image retention limits availability. An older deployment may instead need a source rebuild. See [Railway's rollback guide](https://docs.railway.com/guides/roll-back-bad-deploy). After any rollback, recheck the source declaration and persistent signing/encryption configuration for the restored revision.
 
-Clef requires the database migration head to match its application code. Revision `0020` refuses downgrade once catalog review digests or row review bindings exist. Revision `0019` refuses downgrade once federation publication records exist. Revision `0018` refuses downgrade once a walkthrough or preparation lease has been recorded. Revision `0017` refuses downgrade once disclosure records, retention settings or erasure requests exist. For a fresh, unused database, rehearse any intended downgrade with the candidate migration tooling while API and worker writes are paused. For a used database, retain its schema and use a compatible forward fix or a separately restored database and matching release. Preserve catalog review bindings, publication consent, privacy and walkthrough records during recovery. Earlier migrations have additional evidence-preservation guards documented in [Self-Hosting](SELF_HOSTING.md#machine-credentials-and-audit-retention).
+Clef requires the database migration head to match its application code. Revision `0021` refuses downgrade once federated requests or peer-represented requester organizations exist. Revision `0020` refuses downgrade once catalog review digests or row review bindings exist. Revision `0019` refuses downgrade once federation publication records exist. Revision `0018` refuses downgrade once a walkthrough or preparation lease has been recorded. Revision `0017` refuses downgrade once disclosure records, retention settings or erasure requests exist. For a fresh, unused database, rehearse any intended downgrade with the candidate migration tooling while API and worker writes are paused. For a used database, retain its schema and use a compatible forward fix or a separately restored database and matching release. Preserve catalog review bindings, publication consent, privacy and walkthrough records during recovery. Earlier migrations have additional evidence-preservation guards documented in [Self-Hosting](SELF_HOSTING.md#machine-credentials-and-audit-retention).
 
 Prefer a compatible forward fix when reverting would lose recorded activity. If database recovery requires an older snapshot, preserve the current volume and account for every receipt, report, and decision recorded after the recovery point before reopening writes.
 

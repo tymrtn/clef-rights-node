@@ -2,8 +2,8 @@
 """Run two independent local nodes with consented fictional catalog entries.
 
 Default execution preserves existing fixture edits and publication choices.
---verify requires fresh state, exercises withdrawal/policy changes/peer failure,
-and stops all servers. All data and sign-in links remain in private local state.
+--verify requires fresh state, exercises cross-node requests, public terms,
+withdrawal/policy changes/peer failure, and stops all servers. All data and sign-in links remain in private local state.
 Failures stop for inspection; add the failing case to tests before changing this
 deterministic workflow. No external catalogs, email or model calls are involved.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import datetime as dt
 import io
 import json
 import os
@@ -26,7 +27,8 @@ from run_local_preview import ROOT, free_port, port, preview_environment, privat
 
 sys.path.insert(0, str(ROOT / "backend"))
 import httpx
-from services.policy_vocabulary import USAGE_KEYS, RESTRICTION_KEYS, AI_INPUT_KEYS, AI_MODEL_SCOPE_KEYS, default_ai_policy
+from services.federation import Peer, verify_peer_signature
+from services.policy_vocabulary import USAGE_KEYS, RESTRICTION_KEYS, AI_INPUT_KEYS, AI_MODEL_SCOPE_KEYS, AI_SAFEGUARD_KEYS, default_ai_policy
 from services.receipts import ReceiptSigner
 
 ISRC, ISWC = "ZZDEM2600001", "T1234567894"
@@ -111,7 +113,64 @@ def consent(node, root, claim_id):
         "preview_digest": preview["previewDigest"], "confirm_publication": True})
 
 
-def verify(nodes, fixtures, children):
+APPROVAL = {"decision": "approved", "note": "Fictional approval for the declared instrumental study",
+    "obligations": {"attribution": {"required": True, "credit_text": f"{TITLE} — {ARTIST}", "placements": ["description", "metadata"]},
+        "publication_reporting_required": True, "publication_evidence_due_days": 30, "usage_reporting_frequency": "once"}}
+
+
+def request_body(composition, requester):
+    today = dt.date.today()
+    return {"source_id": composition["source"]["id"], "publication_id": composition["entry"]["publicationId"],
+        "requester_org_id": requester["id"], "intended_usage": "ai_grounded_generation", "territory": "US",
+        "term_start": today.isoformat(), "term_end": (today + dt.timedelta(days=90)).isoformat(),
+        "context": {"restrictionCategories": [], "releaseTitle": f"{TITLE} · 60-second study (fictional)",
+            "aiUse": {"inputAssets": ["composition_data"], "modelScope": "private_single_tenant",
+                "sourceDurationSeconds": 30, "outputDurationSeconds": 60, "lyricCharacters": 0,
+                "sourceRetentionDays": 7, "embeddingRetentionDays": 7, "acceptedSafeguards": list(AI_SAFEGUARD_KEYS)}}}
+
+
+def verify_requests(nodes, fixtures, origins, signers, composition):
+    """A requester on the label node asks the publisher node; only signed answers count."""
+    steps = []
+    label, publisher = nodes
+    requester = next((row for row in label.call("GET", "/v1/session")["organizations"]
+                      if row["slug"] == "connected-example-requester"), None)
+    if not requester:
+        requester = label.call("POST", "/v1/organizations", {"slug": "connected-example-requester",
+            "name": "Example AI Studio · fictional", "organization_type": "requester", "default_territory": "US",
+            "controlled_right_types": []})
+    sent = label.call("POST", "/v1/federation/permission-requests", request_body(composition, requester))
+    assert sent["status"] == "pending" and sent["remotePermissionId"] and sent["receipts"] == []
+    ledger = publisher.call("GET", f"{fixtures[1]['root']}/permission-requests")["permissionRequests"]
+    assert any(row["id"] == sent["remotePermissionId"] for row in ledger)
+    steps.append("A requester on the label node sends a signed request; the publisher node records it pending under its own policy")
+    publisher.call("POST", f"/v1/permission-requests/{sent['remotePermissionId']}/decide", APPROVAL)
+    approved = label.call("POST", f"/v1/federation/permission-requests/{sent['id']}/refresh")
+    assert approved["status"] == "approved" and len(approved["receipts"]) == 1
+    checked = label.call("POST", "/v1/receipts/verify", {"receipt": approved["receipts"][0]})
+    assert checked["valid"] is True and checked["signer"] == "peer:example-publisher"
+    assert publisher.call("POST", "/v1/receipts/verify", {"receipt": approved["receipts"][0]})["signer"] == "this_node"
+    steps.append("The publisher's human approval returns to the label node as a receipt that verifies against the pinned publisher key")
+    with httpx.Client(base_url=origins[1], timeout=10, trust_env=False, follow_redirects=False) as anonymous:
+        again = anonymous.post("/v1/federation/inbound/permission-requests", json=approved["requestStatement"])
+        assert again.status_code == 200 and again.json()["payload"]["permissionRequestId"] == sent["remotePermissionId"]
+        forged_payload = {**approved["requestStatement"]["payload"], "requestId": "forged-" + "x" * 24}
+        impostor = ReceiptSigner(node_id=signers[0].node_id, private_key_b64=None, app_env="development")
+        assert anonymous.post("/v1/federation/inbound/permission-requests", json=impostor.sign_statement(forged_payload)).status_code == 401
+        steps.append("Replaying the signed request returns the same record; a request signed by an impostor key is refused")
+        pin = Peer("publisher", origins[1], signers[1].node_id, signers[1].public_key_b64)
+        terms = anonymous.get(f"/v1/public/catalog/publications/{composition['entry']['publicationId']}")
+        assert terms.status_code == 200 and 'rel="describedby"' in terms.headers.get("link", "")
+        verify_peer_signature(terms.json(), pin)
+        assert terms.json()["payload"]["entry"]["rightType"] == "composition"
+        descriptor = anonymous.get("/.well-known/clef-node")
+        assert descriptor.status_code == 200
+        verify_peer_signature(descriptor.json(), pin)
+        steps.append("Without an account, anyone can read the publisher's signed public terms and node descriptor through its web origin")
+    return steps, requester
+
+
+def verify(nodes, fixtures, children, origins, signers):
     steps = []
     def search(): return nodes[0].call("POST", "/v1/federation/search", {"query": ISRC})
     result = search()
@@ -121,10 +180,16 @@ def verify(nodes, fixtures, children):
     assert len({row["source"]["nodeId"] for row in result["results"]}) == 2
     assert all(row["entry"]["synthetic"] for row in result["results"])
     steps.append("Two separate databases and pinned signers return the recording and composition for one fictional ISRC")
+    composition = next(row for row in result["results"] if row["entry"]["rightType"] == "composition")
+    request_steps, requester = verify_requests(nodes, fixtures, origins, signers, composition)
+    steps.extend(request_steps)
     remote = fixtures[1]; pub = remote["publication"]
     nodes[1].call("POST", f"{remote['root']}/catalog/publications/{pub['id']}/withdraw", {"expected_revision": pub["revision"]})
     assert len(search()["results"]) == 1
     steps.append("An authenticated publisher withdrawal disappears on the next cross-node query")
+    refused = nodes[0].http.post("/v1/federation/permission-requests", headers=nodes[0].headers, json=request_body(composition, requester))
+    assert refused.status_code == 409 and "not currently published" in refused.json()["detail"]
+    steps.append("A request for the withdrawn entry is refused by the publisher node and recorded as not accepted")
     consent(nodes[1], remote["root"], remote["claim"]["id"])
     assert len(search()["results"]) == 2
     steps.append("A new explicit publication review restores the entry")
@@ -204,7 +269,7 @@ def main(argv=None):
             node = Node(origins[i], envs[i]["NODE_OPERATOR_EMAILS"]); nodes.append(node)
             fixtures.append(seed(node, role))
         if args.verify:
-            proof = verify(nodes, fixtures, children)
+            proof = verify(nodes, fixtures, children, origins, signers)
             with private_file(state / "proof.json") as handle:
                 handle.seek(0); json.dump(proof, handle, indent=2); handle.truncate()
             print(json.dumps(proof, indent=2))

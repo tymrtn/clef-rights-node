@@ -38,7 +38,8 @@ def test_real_two_node_failure_proof_and_existing_state_guard(tmp_path):
     proof = subprocess.run([*cmd, "--verify"], cwd=ROOT, capture_output=True, text=True, timeout=45)
     assert proof.returncode == 0, proof.stderr
     data = json.loads(proof.stdout)
-    assert data["synthetic"] is True and len(data["passed"]) == 6
+    assert data["synthetic"] is True and len(data["passed"]) == 11
+    assert any("verifies against the pinned publisher key" in step for step in data["passed"])
     assert len(set(data["nodeIds"])) == 2
     assert json.loads((tmp_path / "proof.json").read_text()) == data
     assert_stopped(ports)

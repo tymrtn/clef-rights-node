@@ -27,7 +27,7 @@ In a node explicitly configured with `NODE_DEPLOYMENT_MODE=public_sandbox`, `SAN
 
 All names, identifiers, mandates and pairings are fictional. The guest plays all reviewers. Stems and lyrics describe permitted inputs; asset delivery and watermarking require a separately connected production service. This preparation endpoint is available only to anonymous public-sandbox guests; adopter environments return 404.
 
-See [self-hosting](SELF_HOSTING.md) for the public-sandbox configuration and signing requirements. Apply `alembic upgrade head` before running this version; the current head is `0020_catalog_review_basis`, following the walkthrough and publication-consent migrations.
+See [self-hosting](SELF_HOSTING.md) for the public-sandbox configuration and signing requirements. Apply `alembic upgrade head` before running this version; the current head is `0021_federated_requests`, following the walkthrough, publication-consent and catalog-review migrations.
 
 ## Search a label and publisher on separate nodes
 

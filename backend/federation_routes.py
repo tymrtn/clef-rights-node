@@ -3,15 +3,17 @@ import asyncio
 import datetime as dt
 import secrets
 import time
+from types import SimpleNamespace
 import uuid
 from fastapi import Depends, Header, HTTPException, Query, Response
+from fastapi.concurrency import run_in_threadpool
 from pydantic import Field, ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models import AuthorityClaimRecord, CatalogPublicationRecord, OrganizationRecord, RightsContractRecord
-from services.federation import (ClosedModel, DiscoveryPayload, FederationConfig, PeerSearchInput, PublicEntry,
-    SCHEMA, SearchInput, STATEMENT_TTL, query_peer, sign_discovery, validate_policy)
+from services.federation import (ClosedModel, DESCRIPTOR_SCHEMA, DiscoveryPayload, FederationConfig, PeerSearchInput,
+    PublicEntry, SCHEMA, SearchInput, STATEMENT_TTL, TERMS_SCHEMA, decode_key, query_peer, sign_discovery, validate_policy)
 from services.receipts import canonical_json, sha256_hex
 
 
@@ -32,6 +34,8 @@ def register_federation_routes(app, *, settings, signer, get_db, require_user, r
                                require_principal, audit, write_lock, vocabulary, default_ai_policy):
     config = FederationConfig.from_settings(settings, signer)
     app.state.federation_config = config
+    if settings.NODE_NEXT_SIGNING_PUBLIC_KEY_B64:
+        decode_key(settings.NODE_NEXT_SIGNING_PUBLIC_KEY_B64)
 
     def enabled(response):
         response.headers["Cache-Control"] = "no-store"
@@ -67,6 +71,9 @@ def register_federation_routes(app, *, settings, signer, get_db, require_user, r
             source = matrix if section in {"usage", "restrictions"} else ai
             fallback = None if section == "limits" else True if section == "safeguards" else "denied" if section == "restrictions" else "blocked"
             policy[section] = {key: (source.get(section) or {}).get(key, fallback) for key in keys}
+        # Stored policies may hold 30.0; publication carries whole numbers only.
+        policy["limits"] = {key: int(value) if type(value) is float and value.is_integer() else value
+                            for key, value in policy["limits"].items()}
         metadata = raw.get("metadata") or {}
         references = {"isrc": metadata.get("recordingIsrc"), "iswc": metadata.get("compositionIswc")}
         if claim.work_key.startswith("isrc:"):
@@ -208,21 +215,60 @@ def register_federation_routes(app, *, settings, signer, get_db, require_user, r
             truncated=len(rows) > 200 or len(entries) > request.limit, entries=entries[:request.limit])
         return sign_discovery(signer, payload)
 
+    def advertise(response):
+        response.headers["Link"] = '</.well-known/clef-node>; rel="describedby"'
+
     @app.post("/v1/federation/catalog/search")
     def public_search(req: PeerSearchInput, response: Response, db: Session = Depends(get_db)):
         current = enabled(response)
+        advertise(response)
         return local_statement(db, req, current)
+
+    @app.get("/v1/public/catalog/publications/{publication_id}")
+    def public_terms(publication_id: str, response: Response, db: Session = Depends(get_db)):
+        """The signed public terms of one published entry, readable without an account."""
+        current = enabled(response)
+        advertise(response)
+        row = db.get(CatalogPublicationRecord, publication_id)
+        entry = current_payload(db, row) if row else None
+        if not entry:
+            raise HTTPException(404, "No current publication with that ID on this node")
+        now = int(time.time())
+        return signer.sign_statement({"schemaVersion": TERMS_SCHEMA, "nodeId": signer.node_id, "origin": current.origin,
+            "issuedAt": now, "expiresAt": now + STATEMENT_TTL, "entry": entry,
+            "requests": {"acceptsFrom": "configured-peer-nodes-and-local-accounts",
+                         "peerEndpoint": "/v1/federation/inbound/permission-requests",
+                         "localEndpoint": "/v1/permission-requests"}})
+
+    @app.get("/.well-known/clef-node")
+    def descriptor(response: Response):
+        current = enabled(response)
+        now = int(time.time())
+        keys = [{"keyId": signer.key_id, "publicKey": signer.public_key_b64, "status": "current"}]
+        if settings.NODE_NEXT_SIGNING_PUBLIC_KEY_B64:
+            keys.append({"publicKey": settings.NODE_NEXT_SIGNING_PUBLIC_KEY_B64, "status": "next"})
+        return signer.sign_statement({"schemaVersion": DESCRIPTOR_SCHEMA, "nodeId": signer.node_id,
+            "origin": current.origin, "issuedAt": now, "expiresAt": now + 3600, "keys": keys,
+            "protocols": [SCHEMA, TERMS_SCHEMA, "clef.permission-request.v1", "clef.permission-status-query.v1",
+                          "clef.permission-status.v1"],
+            "endpoints": {"catalogSearch": "/v1/federation/catalog/search",
+                          "publicTerms": "/v1/public/catalog/publications/{publicationId}",
+                          "permissionRequests": "/v1/federation/inbound/permission-requests",
+                          "permissionStatus": "/v1/federation/inbound/permission-requests/status"},
+            "trust": "Requests are accepted only from peer nodes this operator configured with pinned keys. "
+                     "A valid signature identifies the signing node; it does not establish ownership."})
 
     @app.post("/v1/federation/search")
     async def search(req: SearchInput, response: Response, db: Session = Depends(get_db),
                      x_session_id: str | None = Header(default=None), authorization: str | None = Header(default=None)):
         current = enabled(response)
-        require_principal(db, x_session_id=x_session_id, authorization=authorization,
-                          required_scope="directory:read" if authorization else None)
+        # Database and signing work stays off the event loop that waits on peers.
+        await run_in_threadpool(require_principal, db, x_session_id=x_session_id, authorization=authorization,
+                                required_scope="directory:read" if authorization else None)
         request = PeerSearchInput(**req.model_dump(), nonce=secrets.token_urlsafe(32))
-        own = local_statement(db, request, current)
+        own = await run_in_threadpool(local_statement, db, request, current)
         # Release the read transaction before waiting on network peers.
-        db.rollback()
+        await run_in_threadpool(db.rollback)
         peers = await asyncio.gather(*[query_peer(peer, request, vocabulary, allow_loopback=current.allow_loopback) for peer in current.peers])
         sources = [{"id": "local", "nodeId": signer.node_id, "origin": current.origin, "status": "ok",
                     "entries": own["payload"]["entries"], "statement": own,
@@ -231,3 +277,5 @@ def register_federation_routes(app, *, settings, signer, get_db, require_user, r
                 "truncated": any(p.get("truncated", False) for p in sources), "sources": sources,
                 "results": [{"entry": entry, "source": {k: source[k] for k in ("id", "nodeId", "origin", "expiresAt")}}
                             for source in sources for entry in source["entries"]]}
+
+    return SimpleNamespace(current_payload=current_payload)

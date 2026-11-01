@@ -128,7 +128,7 @@ def prepare(node_root, landing_root, output):
                 'checks':checks,'archive':{'name':'clef-review.tar.gz','sha256':hashlib.sha256(blob).hexdigest(),'bytes':len(blob)},
                 'files':inventory(files),
                 'publicationRequirements':['Approve and commit the reviewed source; publish the exact corresponding source.',
-                  'Build API, web and workers from the same adopted commit; migrate through 0020_catalog_review_basis.',
+                  'Build API, web and workers from the same adopted commit; migrate through 0021_federated_requests.',
                   'Complete the hosted synthetic tour and verify the deployed source, signing key and required worker readiness.',
                   'Publish the matching website and video correction after the sandbox acceptance.',
                   'Complete independent installation and controlled-catalog gates before claiming verified adopter readiness.']}

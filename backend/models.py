@@ -267,7 +267,8 @@ class OrganizationRecord(Base):
     slug = Column(String, nullable=False)
     name = Column(String, nullable=False)
     profile = Column(JSON, nullable=False, default=dict)
-    created_by_user_id = Column(String, ForeignKey("rc_users.id"), nullable=False)
+    # Null only for a requester organization known through a configured federation peer.
+    created_by_user_id = Column(String, ForeignKey("rc_users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
@@ -473,8 +474,9 @@ class PermissionRequestRecord(Base):
     __tablename__ = "rn_permission_requests"
     __table_args__ = (
         CheckConstraint(
-            "((requested_by_user_id IS NOT NULL AND requested_by_api_credential_id IS NULL) "
-            "OR (requested_by_user_id IS NULL AND requested_by_api_credential_id IS NOT NULL))",
+            "((requested_by_user_id IS NOT NULL AND requested_by_api_credential_id IS NULL AND requested_by_peer_node_id IS NULL) "
+            "OR (requested_by_user_id IS NULL AND requested_by_api_credential_id IS NOT NULL AND requested_by_peer_node_id IS NULL) "
+            "OR (requested_by_user_id IS NULL AND requested_by_api_credential_id IS NULL AND requested_by_peer_node_id IS NOT NULL))",
             name="ck_rn_permission_request_single_request_actor",
         ),
         CheckConstraint(
@@ -501,6 +503,7 @@ class PermissionRequestRecord(Base):
         index=True,
         nullable=True,
     )
+    requested_by_peer_node_id = Column(String, index=True, nullable=True)
     decided_by_user_id = Column(String, ForeignKey("rc_users.id"), nullable=True)
     decided_by_api_credential_id = Column(
         String,
@@ -513,6 +516,44 @@ class PermissionRequestRecord(Base):
     decided_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     revoked_at = Column(DateTime, nullable=True)
+
+
+class FederatedInboundRequestRecord(Base):
+    """A configured peer's signed request, bound to the permission request it created here."""
+    __tablename__ = "rn_federated_inbound_requests"
+    __table_args__ = (UniqueConstraint("peer_node_id", "request_id", name="uq_rn_federated_inbound_peer_request"),)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    peer_node_id = Column(String, nullable=False)
+    request_id = Column(String, nullable=False)
+    statement_hash = Column(String, nullable=False)
+    statement = Column(JSON, nullable=False)
+    permission_request_id = Column(String, ForeignKey("rn_permission_requests.id"), nullable=False, unique=True)
+    received_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
+class FederatedOutboundRequestRecord(Base):
+    """A request this node signed for a local organization and sent to a configured peer."""
+    __tablename__ = "rn_federated_outbound_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "NOT (requested_by_user_id IS NOT NULL AND requested_by_api_credential_id IS NOT NULL)",
+            name="ck_rn_federated_outbound_single_actor",
+        ),
+    )
+    id = Column(String, primary_key=True)
+    requester_org_id = Column(String, ForeignKey("rn_organizations.id"), index=True, nullable=False)
+    peer_id = Column(String, nullable=False)
+    peer_node_id = Column(String, nullable=False)
+    peer_origin = Column(String, nullable=False)
+    publication_id = Column(String, nullable=False)
+    request_statement = Column(JSON, nullable=False)
+    remote_permission_id = Column(String, nullable=True)
+    status = Column(String, nullable=False)
+    status_statement = Column(JSON, nullable=True)
+    requested_by_user_id = Column(String, ForeignKey("rc_users.id"), nullable=True)
+    requested_by_api_credential_id = Column(String, ForeignKey("rn_api_credentials.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    refreshed_at = Column(DateTime, nullable=True)
 
 
 class PermissionReviewAssignmentRecord(Base):

@@ -66,6 +66,10 @@ class Settings:
         self.FEDERATION_PUBLIC_ORIGIN = os.getenv("FEDERATION_PUBLIC_ORIGIN", "")
         self.FEDERATION_PEERS_JSON = os.getenv("FEDERATION_PEERS_JSON", "[]")
         self.FEDERATION_ALLOW_LOOPBACK = os.getenv("FEDERATION_ALLOW_LOOPBACK", "false").lower() in ("1", "true", "yes", "on")
+        # The public key this node will sign with after a rotation; peers pin it ahead of the switch.
+        self.NODE_NEXT_SIGNING_PUBLIC_KEY_B64 = os.getenv("NODE_NEXT_SIGNING_PUBLIC_KEY_B64", "")
+        # Public keys this node signed with before a rotation; its older receipts still verify against them.
+        self.NODE_RETIRED_SIGNING_PUBLIC_KEYS_B64 = os.getenv("NODE_RETIRED_SIGNING_PUBLIC_KEYS_B64", "")
         self.SOURCE_CODE_URL = (os.getenv("SOURCE_CODE_URL") or "").strip()
         self.SOURCE_CODE_REVISION = (os.getenv("SOURCE_CODE_REVISION") or "development").strip()
 

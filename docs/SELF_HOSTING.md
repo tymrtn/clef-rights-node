@@ -85,7 +85,7 @@ Only append a payout after the external provider reports a final transaction ide
 
 The node uses an Ed25519 private key encoded as URL-safe base64. Generate it directly in the destination secret manager or another trusted offline environment. Never store it in `.env` files committed to source control.
 
-Changing the key changes the node key identifier. Publish rotations as signed transparency records before retiring the prior key.
+Changing the key changes the node key identifier, and receipts signed by the prior key keep verifying with that key. Before a federated node rotates, announce the next public key with `NODE_NEXT_SIGNING_PUBLIC_KEY_B64` so peers can pin it as `nextPublicKey`; see [connected catalogs](foundation/CATALOG_FEDERATION.md#protocol-and-trust). List retired public keys in `NODE_RETIRED_SIGNING_PUBLIC_KEYS_B64` so `/v1/receipts/verify` keeps recognizing receipts signed before the rotation.
 
 ## Permission expiry scheduler
 

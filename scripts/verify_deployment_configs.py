@@ -141,6 +141,10 @@ def runtime_docker_settings(text: str) -> tuple[dict[str, str], list[list[str]]]
     return environment, copies
 
 
+# Routes a peer node or public reader calls at this node's origin; everything else stays under /api/.
+FEDERATION_LOCATION = r"^/(v1/federation/catalog/search|v1/federation/inbound/|v1/public/catalog/|[.]well-known/clef-node$)"
+
+
 def web_file_errors(nginx: str, dockerfile: str) -> list[str]:
     errors = []
     try:
@@ -155,6 +159,9 @@ def web_file_errors(nginx: str, dockerfile: str) -> list[str]:
         api = locations[0]["children"] if len(locations) == 1 else []
         require(len(locations) == 1 and directives(api, "proxy_pass") == [["$api_upstream"]], "web: /api/ must proxy to the configured private origin", errors)
         require(not any(row and row[0] == "$api_upstream" for row in directives(api, "set")), "web: API location must retain the server's origin", errors)
+        federation = [node for node in server if node["words"] == ["location", "~", FEDERATION_LOCATION] and node["children"] is not None]
+        require(len(federation) == 1 and directives(federation[0]["children"], "proxy_pass") == [["$api_upstream"]],
+                "web: federation and public terms routes must proxy to the configured private origin", errors)
         require(directives(server, "resolver") == [["${NGINX_LOCAL_RESOLVERS}", "valid=10s", "ipv6=on"]], "web: private service DNS must be refreshed after API replacements", errors)
         environment, copies = runtime_docker_settings(dockerfile)
         require(environment.get("NGINX_ENTRYPOINT_LOCAL_RESOLVERS") == "1", "web: runtime image must enable local resolvers", errors)

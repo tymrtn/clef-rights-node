@@ -16,7 +16,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 def test_database_revision_check_fails_closed_until_migration_head_is_recorded():
     engine = create_engine("sqlite:///:memory:")
     expected = expected_alembic_heads(BACKEND_ROOT)
-    assert expected == frozenset({"0020_catalog_review_basis"})
+    assert expected == frozenset({"0021_federated_requests"})
 
     unversioned = database_revision_state(engine, backend_root=BACKEND_ROOT)
     assert unversioned.current is False
@@ -88,6 +88,11 @@ def test_privacy_migration_preserves_existing_receipt_bytes(tmp_path, monkeypatc
     ('rn_catalog_import_rows', {'id':'fixture-row', 'batch_id':'fixture-batch', 'row_number':2,
        'source_json':'{}', 'normalized_json':'{}', 'status':'ready', 'errors':'[]',
        'review_basis':'a' * 64, 'created_at':'2026-09-18'}),
+    ('rn_federated_inbound_requests', {'id':'fixture-inbound', 'peer_node_id':'urn:peer', 'request_id':'fixture-request-0001',
+       'statement_hash':'hash', 'statement':'{}', 'permission_request_id':'fixture-permission', 'received_at':'2026-11-01'}),
+    ('rn_federated_outbound_requests', {'id':'fixture-outbound-0001', 'requester_org_id':'fixture-org', 'peer_id':'peer',
+       'peer_node_id':'urn:peer', 'peer_origin':'https://peer.example.test', 'publication_id':'fixture-publication',
+       'request_statement':'{}', 'status':'pending', 'created_at':'2026-11-01'}),
 ])
 def test_downgrades_preserve_existing_privacy_and_tour_records(tmp_path, monkeypatch, table, values):
     from alembic import command
@@ -102,6 +107,8 @@ def test_downgrades_preserve_existing_privacy_and_tour_records(tmp_path, monkeyp
         'rn_sandbox_tours': ('0018_sandbox_tour', '0017_receipt_privacy'),
         'rn_catalog_publications': ('0019_catalog_federation', '0018_sandbox_tour'),
         'rn_catalog_import_rows': ('0020_catalog_review_basis', '0019_catalog_federation'),
+        'rn_federated_inbound_requests': ('0021_federated_requests', '0020_catalog_review_basis'),
+        'rn_federated_outbound_requests': ('0021_federated_requests', '0020_catalog_review_basis'),
     }.get(table, ('0017_receipt_privacy', '0016_service_heartbeats'))
     command.upgrade(config, revision)
     engine = create_engine(url)
