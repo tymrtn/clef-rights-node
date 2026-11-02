@@ -131,4 +131,12 @@ The verifier records a compact `proof.json`, exits nonzero on a failed assertion
 
 `--allow-loopback` rehearses the same script against the local two-node preview before a hosted run.
 
+On a public sandbox, anonymous guests administer their own synthetic records, so only addresses in `NODE_OPERATOR_EMAILS` may publish. A sandbox that serves as a reference node gets its catalog from the operator, run where the node runs:
+
+```bash
+python seed_reference_catalog.py label --operator-email <operator address>
+```
+
+Then run the hosted proof with `--label-guest`: the label side uses a fresh guest session and confirms that the guest cannot publish.
+
 Before hosting, set `CLIENT_IP_HEADER` (see [Railway deployment](../RAILWAY_DEPLOYMENT.md)). Rate limits key on the client address, and behind the web proxy the API otherwise sees only the proxy, so anonymous reads of the public endpoints could exhaust the allowance that peers and sign-ins depend on.

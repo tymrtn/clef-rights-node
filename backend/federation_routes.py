@@ -49,6 +49,9 @@ def register_federation_routes(app, *, settings, signer, get_db, require_user, r
         enabled(response)
         user = require_user(db, token)
         require_membership(db, org_id=org_id, user_id=user.id, allowed_roles={"owner", "admin"})
+        # Anonymous sandbox guests administer their own synthetic records, so publication stays with the operator.
+        if settings.NODE_DEPLOYMENT_MODE == "public_sandbox" and user.email.lower() not in settings.NODE_OPERATOR_EMAILS:
+            raise HTTPException(403, "On the public sandbox, only the node operator publishes catalog entries")
         return user
 
     def own_claim(db, org_id, claim_id, *, lock=False):
