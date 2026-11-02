@@ -2,6 +2,10 @@
 
 This project follows semantic versioning after its first tagged alpha. Until `1.0.0`, receipt, API, and deployment interfaces may change with documented migration notes.
 
+## Unreleased
+
+- The two-node proofs expect a receipt signed by the peer that answered the search, under the requester node's own name for it. They had assumed the local preview's peer name, so the hosted proof failed against nodes whose operators chose other names.
+
 ## 0.2.1 — reference nodes — 2026-11-02
 
 - On a public sandbox, only addresses in `NODE_OPERATOR_EMAILS` can publish catalog entries. Anonymous guests still search connected catalogs and request terms; the console hides publication controls there.
