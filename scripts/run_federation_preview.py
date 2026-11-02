@@ -76,7 +76,10 @@ def verify_requests(nodes, fixtures, origins, signers, composition, requester_sl
     approved = label.call("POST", f"/v1/federation/permission-requests/{sent['id']}/refresh")
     assert approved["status"] == "approved" and len(approved["receipts"]) == 1
     checked = label.call("POST", "/v1/receipts/verify", {"receipt": approved["receipts"][0]})
-    assert checked["valid"] is True and checked["signer"] == "peer:example-publisher"
+    # Peer IDs are each operator's local names, so expect the one that answered the search.
+    source = composition["source"]
+    assert source["origin"] == origins[1] and source["nodeId"] == signers[1].node_id
+    assert checked["valid"] is True and checked["signer"] == f"peer:{source['id']}"
     assert publisher.call("POST", "/v1/receipts/verify", {"receipt": approved["receipts"][0]})["signer"] == "this_node"
     steps.append("The publisher's human approval returns to the label node as a receipt that verifies against the pinned publisher key")
     with httpx.Client(base_url=origins[1], timeout=10, trust_env=False, follow_redirects=False) as anonymous:
@@ -179,7 +182,7 @@ def main(argv=None):
             envs.append(env); origins.append(origin)
         for i, (role, web_port, api_port) in enumerate((("label", args.label_web_port, args.label_api_port), ("publisher", args.publisher_web_port, args.publisher_api_port))):
             env = envs[i]; other = 1-i; folder = state / role
-            env["FEDERATION_PEERS_JSON"] = json.dumps([{"id": "example-publisher" if i == 0 else "example-label",
+            env["FEDERATION_PEERS_JSON"] = json.dumps([{"id": "local-publisher" if i == 0 else "local-label",
                 "origin": origins[other], "nodeId": signers[other].node_id, "publicKey": signers[other].public_key_b64}])
             log = private_file(folder / "migration.log"); logs.append(log); log.seek(0, os.SEEK_END)
             for command in ([str(python), "-m", "alembic", "upgrade", "head"], [str(python), "-m", "alembic", "check"]):
