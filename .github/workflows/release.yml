@@ -1,4 +1,4 @@
-name: alpha release evidence
+name: release evidence
 
 on:
   push:
@@ -63,11 +63,13 @@ jobs:
           pattern: release-evidence-*
           merge-multiple: true
           path: release-evidence
-      - name: Create immutable alpha release
+      - name: Create immutable release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Only suffixed tags such as v0.3.0-rc.1 are marked as pre-releases.
+          case "$GITHUB_REF_NAME" in *-*) stage="--prerelease" ;; *) stage="" ;; esac
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease \
+            gh release create "$GITHUB_REF_NAME" --verify-tag $stage \
               --title "Clef Rights Node $GITHUB_REF_NAME" --notes-file CHANGELOG.md
           gh release upload "$GITHUB_REF_NAME" --clobber release-evidence/*

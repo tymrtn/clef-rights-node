@@ -1,6 +1,6 @@
 # Claims and limits
 
-This file is the canonical public-claim boundary for the alpha. A capability belongs in marketing copy only when a current test, verifier, or source reference supports it.
+This file is the canonical public-claim boundary for the current release. A capability belongs in marketing copy only when a current test, verifier, or source reference supports it.
 
 ## Implemented
 

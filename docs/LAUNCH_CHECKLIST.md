@@ -8,7 +8,7 @@ Choose the launch scope before applying the gates below.
 
 ## Automated gates
 
-- `make verify-alpha` reproduces every local alpha gate with one command.
+- `make verify` reproduces every local release gate with one command.
 - `make verify-public` passes across every public Git blob and current non-ignored file, rejecting private artifacts, credentials, personal correspondence, private keys, and blobs larger than 5 MiB without echoing matched values.
 - `make test-local` passes, including `backend/tests/test_permission_safety.py`: every denied content category, territorial containment, policy and authority changes during pending review, and party-only receipt downloads.
 - Deploy the API and matching console together; validate private grant, lifecycle and settlement receipt access, plus public verification of a supplied receipt.

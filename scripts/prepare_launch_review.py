@@ -113,7 +113,7 @@ def prepare(node_root, landing_root, output):
         try:
             before={'rights-node':collect(node_root),'website':collect(landing_root)}
             bases={name:git(root,'rev-parse','HEAD').decode().strip() for name,root in [('rights-node',node_root),('website',landing_root)]}
-            checks=[run_check(['make','verify-alpha'],node_root,stage/'rights-node-checks.log'),
+            checks=[run_check(['make','verify'],node_root,stage/'rights-node-checks.log'),
                     run_check(['uvx','--from','pip-audit==2.10.1','pip-audit','--require-hashes','--disable-pip','-r','backend/requirements.lock'],node_root,stage/'dependency-audit.log'),
                     run_check(['npm','run','build'],landing_root,stage/'website-checks.log')]
             after={'rights-node':collect(node_root),'website':collect(landing_root)}

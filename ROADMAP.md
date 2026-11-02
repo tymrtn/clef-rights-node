@@ -2,13 +2,23 @@
 
 Roadmap items describe intent, not shipped capability or a delivery promise.
 
-## Alpha: inspect and deploy
+## Released: v0.1.0-alpha.1 (2026-08-13)
 
-- Publish reproducible source, synthetic workflow evidence, Docker deployment, provisional adopter-owned Railway instructions, and public review routes.
-- Document every material claim, boundary, threat, and unresolved production dependency.
-- Complete one clean installation outside the development machine.
+- Reproducible source, synthetic workflow evidence, Docker deployment, provisional adopter-owned Railway instructions, and public review routes.
+- Every material claim, boundary, threat, and unresolved production dependency documented.
 
-## Design-partner release
+## Current: v0.2.0 design-partner preview
+
+Shipped in this release:
+
+- Connected catalogs among configured, key-pinned nodes: consented publication, signed search, account-free public terms, and signed cross-node permission requests decided by the source node.
+
+Open before founding partners connect:
+
+- Clef-operated reference nodes, hosted, that a partner's node can pin and query, verified by `scripts/verify_hosted_federation.py`.
+- One clean installation outside the development machine.
+
+Continuing through the preview:
 
 - Improve onboarding from observed installation failures.
 - Add portable deployment readiness, organization milestones, and email providers.
