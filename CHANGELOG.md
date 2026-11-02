@@ -5,6 +5,7 @@ This project follows semantic versioning after its first tagged alpha. Until `1.
 ## Unreleased
 
 - The two-node proofs expect a receipt signed by the peer that answered the search, under the requester node's own name for it. They had assumed the local preview's peer name, so the hosted proof failed against nodes whose operators chose other names.
+- Connected-catalog search no longer tells visitors who cannot publish, such as public sandbox guests, to use publication controls, and the fictional-catalog note says "independent nodes" since the reference nodes are hosted.
 
 ## 0.2.1 — reference nodes — 2026-11-02
 

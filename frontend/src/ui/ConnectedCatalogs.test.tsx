@@ -104,6 +104,15 @@ describe("connected catalogs in the rendered console", () => {
     expect(rendered()).not.toContain("Stale query");
   });
 
+  it("does not point a visitor who cannot publish to publication controls", async () => {
+    stubFetch(vi.fn(async () => ok({ query: "Unknown", checkedAt: Math.floor(Date.now() / 1000), sources: [], results: [], partial: false, truncated: false })));
+    await act(async () => { view = create(<ConnectedCatalogs sessionId="session-1" organizationId="org-1" organizations={organizations} canPublish={false} synthetic />); });
+    await act(async () => { view!.root.findByType("form").props.onSubmit({ preventDefault() {} }); });
+    expect(rendered()).toContain("No published entries matched this search.");
+    expect(rendered()).not.toContain("publication controls");
+    expect(rendered()).not.toContain("local nodes");
+  });
+
   it("keeps content eligibility separate from permission for a use", async () => {
     const now = Math.floor(Date.now() / 1000);
     const source = { id: "local", nodeId: "urn:local", origin: "https://label.example.test", expiresAt: now + 60 };
