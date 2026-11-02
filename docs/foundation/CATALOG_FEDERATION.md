@@ -131,4 +131,4 @@ The verifier records a compact `proof.json`, exits nonzero on a failed assertion
 
 `--allow-loopback` rehearses the same script against the local two-node preview before a hosted run.
 
-Before hosting, decide how the API learns client addresses. Rate limits key on the address the API sees, and behind the web proxy that is the proxy itself unless the API trusts forwarded headers from it. Left as is, all public traffic shares one limit: anonymous reads of the public endpoints can exhaust the allowance peers and sign-ins depend on. Trusting forwarded headers safely depends on the hosting platform's edge proxy, so verify it on the staging deployment.
+Before hosting, set `CLIENT_IP_HEADER` (see [Railway deployment](../RAILWAY_DEPLOYMENT.md)). Rate limits key on the client address, and behind the web proxy the API otherwise sees only the proxy, so anonymous reads of the public endpoints could exhaust the allowance that peers and sign-ins depend on.

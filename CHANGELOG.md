@@ -17,6 +17,8 @@ This project follows semantic versioning after its first tagged alpha. Until `1.
 
 ### Discovery hardening
 
+- Added `CLIENT_IP_HEADER` so rate limits key on the client address the hosting edge reports (`X-Real-IP` on Railway). Behind the web proxy every client previously shared one limit, including the sign-in link limit.
+
 - Enforced a total peer transport deadline by closing the socket, so a peer that drips bytes cannot hold a worker; added per-peer capacity within a larger shared pool so one slow peer cannot starve searches of others.
 - Moved buyer-search database and signing work off the event loop.
 - Rejected multicast destinations, and invisible, bidirectional-override, private-use and unassigned characters in search queries.

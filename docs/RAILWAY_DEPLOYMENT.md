@@ -45,7 +45,10 @@ CONSOLE_BASE_URL=https://<web-domain>
 CORS_ALLOW_ORIGINS=https://<web-domain>
 STRUCTURED_LOGGING=true
 WEBHOOK_ALLOW_PRIVATE_TARGETS=false
+CLIENT_IP_HEADER=X-Real-IP
 ```
+
+`CLIENT_IP_HEADER` makes rate limits key on each client. Railway's edge sets `X-Real-IP` to the client address, and the web proxy passes it to the API unchanged. Without it, every request arrives from the web service and all clients share one limit, sign-in links included. After deploying, confirm that a request carrying its own `X-Real-IP` still reaches the limit for its real address. Set the variable only where the API is unreachable except through that edge and proxy.
 
 SMTP is the portable default. An adopter may instead set `NOTIFICATION_PROVIDER=mailgun`, `MAILGUN_API_KEY`, `MAILGUN_DOMAIN`, and `NOTIFICATION_FROM_EMAIL`; remove the SMTP values in that case. Public-sandbox deployments set `NOTIFICATION_PROVIDER=disabled`, while adopter staging and production fail startup without a complete provider.
 
