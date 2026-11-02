@@ -5983,6 +5983,9 @@ def create_organization(
         raise HTTPException(status_code=422, detail="Organization slug must use letters, numbers, hyphens, or underscores")
     if slug.startswith("peer-"):
         raise HTTPException(status_code=422, detail="The peer- prefix is reserved for organizations represented from other nodes")
+    if (settings.NODE_DEPLOYMENT_MODE == "public_sandbox" and slug.startswith("connected-example-")
+            and user.email.lower() not in settings.NODE_OPERATOR_EMAILS):
+        raise HTTPException(status_code=422, detail="connected-example- slugs are reserved for the operator's reference catalog")
     organization_type = req.organization_type.strip().lower()
     if organization_type not in ORGANIZATION_TYPES:
         raise HTTPException(status_code=422, detail="Unsupported organization type")
@@ -6078,6 +6081,10 @@ def add_organization_member(
     email = req.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=422, detail="A valid member email is required")
+    # Anonymous guests could otherwise enroll a real person, including the operator, in a record they control.
+    if (settings.NODE_DEPLOYMENT_MODE == "public_sandbox" and actor.email.lower() not in settings.NODE_OPERATOR_EMAILS
+            and not email.endswith("@sandbox.invalid")):
+        raise HTTPException(status_code=422, detail="Public sandbox members use synthetic @sandbox.invalid addresses")
     role = req.role.strip().lower()
     if role not in {"admin", "rights_manager", "member"}:
         raise HTTPException(status_code=422, detail="Member role must be admin, rights_manager, or member")

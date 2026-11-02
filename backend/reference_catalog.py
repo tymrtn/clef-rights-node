@@ -36,6 +36,11 @@ def seed(node, role):
     name = "Example Records · fictional" if role == "label" else "Example Publishing · fictional"
     context = node.call("GET", "/v1/session")
     org = next((row for row in context["organizations"] if row["slug"] == slug), None)
+    if org:
+        # Publish only from an organization this account alone controls, never one it was added to.
+        members = node.call("GET", f"/v1/organizations/{org['id']}/members")["members"]
+        if [(row["email"], row["role"]) for row in members] != [(context["user"]["email"], "owner")]:
+            raise RuntimeError(f"The {slug} organization has other members or another owner; refusing to publish from it")
     if not org:
         org = node.call("POST", "/v1/organizations", {"slug": slug, "name": name,
             "organization_type": role, "default_territory": "US", "controlled_right_types": [right]})
