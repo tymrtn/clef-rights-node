@@ -3,7 +3,7 @@
 ## Claim ledger — 1 November 2026
 
 - **Central claim:** an organization can explicitly publish selected catalog fields. Anyone can read those published terms from the source node without an account. A requester on a configured peer node can submit a permission request through its own node, and it receives the source node's decision, which carries a receipt that verifies against the source's pinned key. The source node decides under its own policy and reviewers.
-- **Evidence:** `backend/tests/test_federated_requests.py`, `backend/tests/test_federation.py`, `backend/tests/test_federation_hardening.py`, the rendered `ConnectedCatalogs.test.tsx` tests, and `scripts/run_federation_preview.py --verify`. The live verifier runs two separate APIs, databases, signers and web proxies. It sends a signed cross-node request, records the source's human approval, verifies the returned receipt on the requesting node, replays the request, refuses an impostor signature, reads the public terms and node descriptor without an account, and exercises withdrawal, policy changes and an unavailable peer. `scripts/verify_hosted_federation.py` runs the same request proof against two HTTPS deployments; it has been rehearsed locally and has not yet run against hosted nodes.
+- **Evidence:** `backend/tests/test_federated_requests.py`, `backend/tests/test_federation.py`, `backend/tests/test_federation_hardening.py`, the rendered `ConnectedCatalogs.test.tsx` tests, and `scripts/run_federation_preview.py --verify`. The live verifier runs two separate APIs, databases, signers and web proxies. It sends a signed cross-node request, records the source's human approval, verifies the returned receipt on the requesting node, replays the request, refuses an impostor signature, reads the public terms and node descriptor without an account, and exercises withdrawal, policy changes and an unavailable peer. `scripts/verify_hosted_federation.py` runs the same request proof against two HTTPS deployments. On 2026-11-02 it passed all seven steps between Clef's two reference nodes; both are operated by Clef (see [Hosted proof](#hosted-proof)).
 - **Scope:** configured peers only. Operators establish peer identity and keys out of band, and each node accepts requests from the peers it pins. The originating organization's reviewers decide requests; negotiation, payment and agreement exchange across nodes are absent. Published terms are readable by anyone, and nothing forces a crawler or model operator to read or honor them.
 - **Falsifier:** an unpublished or withdrawn entry appears in a new source response or accepts a new request; another tenant can publish it; a changed policy remains advertised under stale consent; private evidence travels in a search result or public terms; a forged, expired or unpinned statement passes; a replayed request creates a second permission request; a requesting node accepts a receipt signed by a key other than the source's pin; or an unavailable peer is reported as a complete search.
 - **Why it matters:** an AI company or producer can ask a label or publisher on another node for terms through its own node, and both sides keep a verifiable record of what was asked and what was decided.
@@ -138,5 +138,22 @@ python seed_reference_catalog.py label --operator-email <operator address>
 ```
 
 Then run the hosted proof with `--label-guest`: the label side uses a fresh guest session and confirms that the guest cannot publish.
+
+### Clef's reference nodes
+
+Clef runs two nodes with the fictional catalog, each pinning the other. On 2026-11-02 the hosted proof passed between them, with the sandbox side run as an anonymous guest.
+
+| Role | Origin | Node ID | Key ID |
+| --- | --- | --- | --- |
+| Label (public sandbox) | `https://label.nodes.clef.pro` | `urn:clef:rights-node:public-sandbox` | `ed25519:8bb9aa5be04dc22c86cc42f5` |
+| Publisher | `https://publisher.nodes.clef.pro` | `urn:clef:rights-node:reference-publisher` | `ed25519:7f062a8a941db7841dbe97a5` |
+
+A partner's node can pin either one and search it at once:
+
+```bash
+python scripts/federation_peer.py https://publisher.nodes.clef.pro --id clef-publisher --expect-key-id ed25519:7f062a8a941db7841dbe97a5
+```
+
+Confirm the key ID with Clef through a channel other than this repository before pinning it. A reference node answers signed requests only from nodes it pins in turn, so a partner who wants to send requests asks Clef to pin their node.
 
 Before hosting, set `CLIENT_IP_HEADER` (see [Railway deployment](../RAILWAY_DEPLOYMENT.md)). Rate limits key on the client address, and behind the web proxy the API otherwise sees only the proxy, so anonymous reads of the public endpoints could exhaust the allowance that peers and sign-ins depend on.

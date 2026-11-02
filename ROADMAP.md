@@ -12,10 +12,11 @@ Roadmap items describe intent, not shipped capability or a delivery promise.
 Shipped in this release:
 
 - Connected catalogs among configured, key-pinned nodes: consented publication, signed search, account-free public terms, and signed cross-node permission requests decided by the source node.
+- v0.2.1: two Clef-operated reference nodes, `label.nodes.clef.pro` (the public sandbox) and `publisher.nodes.clef.pro`, between which `scripts/verify_hosted_federation.py` passed on 2026-11-02.
 
 Open before founding partners connect:
 
-- Clef-operated reference nodes, hosted, that a partner's node can pin and query, verified by `scripts/verify_hosted_federation.py`.
+- Pin a founding partner's node on a reference node, so searches and signed requests cross an organization boundary as well as a network one.
 - One clean installation outside the development machine.
 
 Continuing through the preview:
