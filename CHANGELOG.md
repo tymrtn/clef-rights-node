@@ -5,6 +5,7 @@ This project follows semantic versioning after its first tagged alpha. Until `1.
 ## 0.2.1 — reference nodes (unreleased)
 
 - On a public sandbox, only addresses in `NODE_OPERATOR_EMAILS` can publish catalog entries. Anonymous guests still search connected catalogs and request terms; the console hides publication controls there.
+- On a public sandbox, guests may add only synthetic `@sandbox.invalid` members and cannot create `connected-example-` organizations, and the seed command publishes only from an organization the operator alone owns. Together these stop a guest from enrolling the operator in a guest-controlled record that the operator would then publish.
 - Added `seed_reference_catalog.py`, run where the node runs, to publish its clearly labelled fictional reference catalog as the operator through the node's own API, with a session that exists only for the run.
 - `scripts/verify_hosted_federation.py --label-guest` runs the hosted proof with a fresh sandbox guest on the label node and also shows that the guest cannot publish.
 - The local preview, the hosted verifier and the seed command share one fictional catalog definition (`backend/reference_catalog.py`).
