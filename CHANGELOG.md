@@ -2,7 +2,7 @@
 
 This project follows semantic versioning after its first tagged alpha. Until `1.0.0`, receipt, API, and deployment interfaces may change with documented migration notes.
 
-## 0.2.1 — reference nodes (unreleased)
+## 0.2.1 — reference nodes — 2026-11-02
 
 - On a public sandbox, only addresses in `NODE_OPERATOR_EMAILS` can publish catalog entries. Anonymous guests still search connected catalogs and request terms; the console hides publication controls there.
 - On a public sandbox, guests may add only synthetic `@sandbox.invalid` members and cannot create `connected-example-` organizations, and the seed command publishes only from an organization the operator alone owns. Together these stop a guest from enrolling the operator in a guest-controlled record that the operator would then publish.
