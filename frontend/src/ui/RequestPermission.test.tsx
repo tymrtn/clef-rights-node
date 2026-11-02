@@ -3,6 +3,8 @@ import { act, create, type ReactTestInstance, type ReactTestRenderer } from "rea
 import { afterEach, expect, it, vi } from "vitest";
 import { RequestPermission } from "./RightsNodeApp";
 
+const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
+
 const claim = { id: "claim-1", organization: { id: "publisher-1", name: "Example Publishing · fictional" }, workKey: "iswc:T1234567894",
   workTitle: "Paper Skies", artistName: "Mara Vale (fictional)", rightType: "composition", territory: "US", verificationStatus: "verified",
   matrix: { usage: { ai_grounded_generation: "requires_approval" }, restrictions: { political: "denied" } },
@@ -34,7 +36,7 @@ it("sends the declared content and AI scope for a local request once every gate 
   expect(submit().props.disabled).toBe(true);
   act(() => checkbox("I have reviewed every category. My selections describe this use; leaving all categories clear means none apply.").props.onChange({ target: { checked: true } }));
   await act(async () => { view!.root.findByType("form").props.onSubmit({ preventDefault() {} }); });
-  expect(writes).toEqual([{ url: "/v1/permission-requests", body: { requester_org_id: "org-1", authority_claim_id: "claim-1",
+  expect(writes).toEqual([{ url: `${API_BASE}/v1/permission-requests`, body: { requester_org_id: "org-1", authority_claim_id: "claim-1",
     intended_usage: "ai_grounded_generation", territory: "worldwide", term_start: "2026-12-01", term_end: "2027-11-30", provenance: {},
     context: { releaseTitle: "", restrictionCategories: ["political"], aiUse: { inputAssets: ["full_mix"], modelScope: "private_single_tenant",
       acceptedSafeguards: ["attribution"], sourceDurationSeconds: null, outputDurationSeconds: null, lyricCharacters: null,
