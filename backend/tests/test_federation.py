@@ -16,7 +16,7 @@ from services import federation
 from services.federation import FederationConfig, Peer, PeerSearchInput, validate_origin, verify_statement
 from services.receipts import ReceiptSigner
 from services.receipts import canonical_json
-from test_api import (app, client, SessionLocal, _session_headers, _create_api_credential, receipt_signer,
+from test_api import (app, client, settings, SessionLocal, _session_headers, _create_api_credential, receipt_signer,
     USAGE_KEYS, RESTRICTION_KEYS, AI_INPUT_KEYS, AI_MODEL_SCOPE_KEYS, AI_LIMIT_KEYS, AI_SAFEGUARD_KEYS)
 from test_sandbox_tour import guest, prepared
 
@@ -28,6 +28,8 @@ VOCABULARY = {"usage": USAGE_KEYS, "restrictions": RESTRICTION_KEYS, "inputs": A
 def connected(guest, monkeypatch):
     monkeypatch.setattr(app.state, "federation_config", FederationConfig(True, "https://node.example.test"))
     tour = prepared(guest)
+    # Publication runs as on an operator-run node; the public sandbox reserves it for its operator.
+    monkeypatch.setattr(settings, "NODE_DEPLOYMENT_MODE", "local_evaluation")
     side = tour["sides"][0]
     # Every guest's tour uses the same fictional title; a unique label keeps searches hermetic.
     side["label"] = f"Fictional Label {uuid.uuid4().hex[:12]}"
@@ -328,3 +330,11 @@ def test_long_multibyte_source_entries_fit_the_real_peer_transport(connected, ht
     transported = federation.fetch_statement(peer, request, allow_loopback=True)
     verified = verify_statement(transported, peer, request, VOCABULARY)
     assert verified["truncated"] is True and 0 < len(verified["entries"]) < 50
+
+
+def test_public_sandbox_guests_cannot_publish_to_connected_catalogs(connected, monkeypatch):
+    headers, _, side, root = connected
+    monkeypatch.setattr(settings, "NODE_DEPLOYMENT_MODE", "public_sandbox")
+    response = client.post(f"{root}/preview", headers=headers, json={"authority_claim_id": side["authority"]["id"]})
+    assert response.status_code == 403 and "operator" in response.json()["detail"]
+    assert client.post("/v1/federation/search", headers=headers, json={"query": "Paper Skies"}).status_code == 200

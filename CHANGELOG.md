@@ -2,6 +2,13 @@
 
 This project follows semantic versioning after its first tagged alpha. Until `1.0.0`, receipt, API, and deployment interfaces may change with documented migration notes.
 
+## 0.2.1 — reference nodes (unreleased)
+
+- On a public sandbox, only addresses in `NODE_OPERATOR_EMAILS` can publish catalog entries. Anonymous guests still search connected catalogs and request terms; the console hides publication controls there.
+- Added `seed_reference_catalog.py`, run where the node runs, to publish its clearly labelled fictional reference catalog as the operator through the node's own API, with a session that exists only for the run.
+- `scripts/verify_hosted_federation.py --label-guest` runs the hosted proof with a fresh sandbox guest on the label node and also shows that the guest cannot publish.
+- The local preview, the hosted verifier and the seed command share one fictional catalog definition (`backend/reference_catalog.py`).
+
 ## 0.2.0 — design-partner preview — 2026-11-02
 
 ### Cross-node permission requests and public terms
