@@ -142,7 +142,13 @@ def configure_logging():
 
 configure_logging()
 
-limiter = Limiter(key_func=get_remote_address, default_limits=[settings.RATE_LIMIT])
+def _client_address(request: Request) -> str:
+    """Behind the web proxy, the edge's client header distinguishes clients; otherwise the socket peer does."""
+    supplied = request.headers.get(settings.CLIENT_IP_HEADER) if settings.CLIENT_IP_HEADER else None
+    return supplied.strip() if supplied and supplied.strip() else get_remote_address(request)
+
+
+limiter = Limiter(key_func=_client_address, default_limits=[settings.RATE_LIMIT])
 
 app = FastAPI(title="Clef Rights Node API", version="0.2.0")
 app.state.limiter = limiter

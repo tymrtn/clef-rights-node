@@ -162,6 +162,9 @@ class Settings:
         origins = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:6482,http://localhost:5174")
         self.CORS_ALLOW_ORIGINS = [o.strip() for o in origins.split(",") if o.strip()]
         self.RATE_LIMIT = os.getenv("RATE_LIMIT", "100/minute")
+        # A header the hosting platform's edge sets to the client address (X-Real-IP on Railway).
+        # Leave empty when clients reach the API directly; a client could otherwise choose its own key.
+        self.CLIENT_IP_HEADER = os.getenv("CLIENT_IP_HEADER", "").strip()
 
         # Logging
         self.STRUCTURED_LOGGING = os.getenv("STRUCTURED_LOGGING", "false").lower() in ("1", "true", "yes", "on")
