@@ -1,4 +1,4 @@
-.PHONY: up down reset logs seed test test-local install-ddex-schemas verify-ddex verify-workflow verify-real-pilot verify-deployment verify-public verify-alpha verify-running verify-release expire-due deliver-webhooks build build-backend build-frontend
+.PHONY: up down reset logs seed test test-local install-ddex-schemas verify-ddex verify-workflow verify-real-pilot verify-deployment verify-public verify verify-alpha verify-running verify-release expire-due deliver-webhooks build build-backend build-frontend
 
 DC=docker compose
 DDEX_SCHEMA_DIR?=var/ddex/mwl-1.0.1
@@ -43,13 +43,16 @@ verify-deployment:
 verify-public:
 	.venv/bin/python scripts/verify_public_repository.py
 
-verify-alpha: test-local
+verify: test-local
 	cd frontend && npm run build
 	$(MAKE) verify-workflow
 	$(MAKE) verify-ddex
 	$(MAKE) verify-deployment
 	$(MAKE) verify-public
 	git diff --check
+
+# Earlier name of the full local gate, kept for existing scripts and notes.
+verify-alpha: verify
 
 verify-running:
 	.venv/bin/python scripts/verify_deployment.py

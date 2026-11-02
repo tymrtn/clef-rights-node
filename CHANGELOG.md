@@ -2,7 +2,7 @@
 
 This project follows semantic versioning after its first tagged alpha. Until `1.0.0`, receipt, API, and deployment interfaces may change with documented migration notes.
 
-## Unreleased
+## 0.2.0 — design-partner preview (unreleased)
 
 ### Cross-node permission requests and public terms
 

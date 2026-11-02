@@ -12,7 +12,7 @@ Previous thesis (18 September 2026): "an organization can explicitly publish sel
 
 Current thesis (1 November 2026): the sentence under **Central claim** above.
 
-This expands the demonstrated capability: requests now cross nodes, and published terms have an account-free reading path. The previous claim is preserved in full. The current released alpha and public deployments retain their own release boundaries; enablement and deployment require the operator's release review.
+This expands the demonstrated capability: requests now cross nodes, and published terms have an account-free reading path. The previous claim is preserved in full. The released v0.1.0-alpha.1 and current public deployments retain their own release boundaries; enablement and deployment require the operator's release review.
 
 ## The administrator's flow
 

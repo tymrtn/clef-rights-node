@@ -29,7 +29,7 @@ The MLC supplies publishing references in a U.S. administrative context and DSP-
 
 - Run `.venv/bin/python scripts/run_local_preview.py` for the resumable guided example. Its default console is `http://127.0.0.1:16482`.
 - Run `.venv/bin/python scripts/run_federation_preview.py --state-dir /private/path/to/fresh-preview --verify` for a tested pair of local nodes. Search spans the configured participants; adding a participant requires its origin and verified signing key.
-- Run `make verify-alpha` for the full source, application, workflow, XML-fixture and deployment-configuration checks. Run `scripts/verify_container_preview.py` against locally built images to exercise the shipped web proxy.
+- Run `make verify` for the full source, application, workflow, XML-fixture and deployment-configuration checks. Run `scripts/verify_container_preview.py` against locally built images to exercise the shipped web proxy.
 - Read the [AI policy schema](foundation/AI_POLICY_SCHEMA.md), [federation protocol](foundation/CATALOG_FEDERATION.md), [receipt protocol](foundation/RECEIPT_PROTOCOL.md), [trust model](foundation/TRUST_MODEL.md) and [launch checklist](LAUNCH_CHECKLIST.md).
 
 ## Questions worth answering before a pilot

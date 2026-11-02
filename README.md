@@ -1,6 +1,6 @@
 # Clef Rights Node
 
-> **Public alpha candidate.** The protocol and reference implementation are open for inspection and testing. Do not use this build as evidence of legal authority, partner acceptance, payment, or production readiness. Start with the [15-minute synthetic walkthrough](docs/QUICKSTART.md), then read the [claims and limits](docs/CLAIMS_AND_LIMITS.md).
+> **Design-partner preview, v0.2.0.** Labels and publishers can run their own nodes, publish terms for AI use, and exchange signed permission requests with configured peer nodes. Founding design partners shape the protocol before 1.0. This build is not evidence of legal authority, partner acceptance, payment, or production readiness. Start with the [15-minute synthetic walkthrough](docs/QUICKSTART.md), then read the [claims and limits](docs/CLAIMS_AND_LIMITS.md).
 
 Clef Rights Node gives labels, publishers, PROs, CMOs, collectives, and other rights administrators a self-hosted permissions desk for represented creators. It records who claimed authority over a musical work or recording, what use a requester proposed, who approved it, and exactly what the resulting receipt proves; independent artists and requester organizations can also run their own nodes.
 
@@ -406,7 +406,7 @@ This command migrates the test database and leaves synthetic workflow records fo
 Run these after a code change or deployment configuration change:
 
 ```bash
-make verify-alpha
+make verify
 ```
 
 That single command runs the backend suite, production frontend build, 30-gate synthetic rights-holder workflow, pinned DDEX fixtures, deployment-configuration checks, public-history privacy and credential scan, and patch-whitespace validation. `make verify-public` can run the repository scan independently; it examines every public Git blob plus the current non-ignored working tree and never prints matched secret values.
@@ -457,10 +457,10 @@ Do not describe the node as an automated substitute for The MLC, a PRO, DDEX exc
 
 The inherited demo can still be evaluated with `env.demo.sample` and `VITE_DEMO_MODE=true`. Production images default to the authenticated Rights Node console; demo routes remain unavailable while `DEMO_MODE=false`.
 
-## Participate in the alpha
+## Become a design partner
 
 - Operators: deploy a synthetic node and file a deployment report.
-- Rights administrators: apply for the first controlled public case through Clef.pro after the application route is published.
+- Labels, publishers and rights administrators: apply to run a founding node, and to become the first controlled public case, through Clef.pro after the application route is published.
 - Protocol and security reviewers: use the review packet and report security defects privately.
 - Implementers: propose compatibility changes through an RFC; report standards gaps without implying endorsement by a standards body.
 
