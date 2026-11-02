@@ -277,7 +277,7 @@ export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, org
   return <div className="connected-catalogs">
     <header className="connected-intro"><p className="connected-eyebrow">Catalog discovery</p><h1>Search connected catalogs.</h1>
       <p>Find a recording, its composition and the organizations reviewing each use. Each catalog publishes its own artist choices and keeps its records at the source.</p>
-      {synthetic && <p className="connected-note">Fictional catalog demonstration · independent local nodes · illustrative identifiers</p>}
+      {synthetic && <p className="connected-note">Fictional catalog demonstration · independent nodes · illustrative identifiers</p>}
     </header>
     <form className="connected-search" onSubmit={search}><label htmlFor="connected-query">Track, artist, catalog, ISRC or ISWC</label>
       <div><input id="connected-query" value={query} minLength={2} maxLength={200} placeholder="Search participating catalogs" onChange={event => setQuery(event.target.value)} />
@@ -294,7 +294,7 @@ export function ConnectedCatalogs({ apiBase = "", sessionId, organizationId, org
       {result.partial && <p role="status" className="connected-warning">Some sources could not answer. These results cover the sources that responded; search again to check the others.</p>}
       {result.truncated && <p className="connected-warning">More entries may be available. Narrow your search by identifier or catalog name.</p>}
       {expired && <p role="status" className="connected-warning">One or more source statements have expired. Search again to refresh those catalog results.</p>}
-      {!result.results.length && <p>No published entries matched this search. An organization can share a verified catalog entry using the publication controls below.</p>}
+      {!result.results.length && <p>No published entries matched this search.{canPublish && " An organization can share a verified catalog entry using the publication controls below."}</p>}
       <div className="connected-records">{result.results.map(({ entry, source }, index) => <article key={`${source.nodeId}:${entry.publicationId}`} aria-label={`${entry.organization.name} catalog result`}>
         <div className="connected-record-kind"><span>{label(entry.rightType)}</span><span>{entry.territory}</span></div>
         <h3>{entry.workTitle}</h3><p className="connected-artist">{entry.artistName}</p><p className="connected-owner">Published by <strong>{entry.organization.name}</strong></p>
